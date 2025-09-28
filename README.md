@@ -215,7 +215,7 @@ python main.py
 ### 获取帮助
 - **项目维护**: 陈樟权，牛垚鑫，周启杨
 - **联系邮箱**: 1565850058@qq.com 
-- **项目地址**: [GitHub仓库链接]
+- **项目地址**: [[GitHub仓库链接]](https://github.com/YXNiu/Marking-Tool.git)
 - **问题反馈**: 提交GitHub Issue
 
 ### 版本信息
