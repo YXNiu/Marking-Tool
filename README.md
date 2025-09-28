@@ -36,6 +36,21 @@ cd annotation-tool
 # 安装依赖
 pip install PyQt5 numpy pillow
 
+# 文件结构
+你的项目位置/
+└── annotation-tool/              # 项目文件夹
+    ├── main.py
+    ├── bbox_canvas.py
+    ├── data_processor.py
+    ├── convert_vlmr1_to_our_format.py
+    ├── data/
+    │   ├── vlmr1_converted.json   # 转换数据（运行convert脚本后生成）
+    │   ├── mllm_rec_json.json     # 原始VLM-R1数据（手动放置）
+    │   └── train2014/
+    │       ├── COCO_val2014_000000525439.jpg
+    │       ├── COCO_val2014_000000097131.jpg
+    │       └── ... (图片文件)
+    └── output/                    # 标注结果（程序自动创建）
 
 # 转换VLM-R1数据（如需）
 python convert_vlmr1_to_our_format.py
@@ -46,7 +61,7 @@ python main.py
 
 ### 首次启动
 1. 选择标注起点（从头开始或继续之前工作）
-2. 点击"加载数据文件"选择JSON数据文件
+2. 点击"加载数据文件"选择JSON数据文件（选择转换后的vlmr1_converted.json）
 3. 开始标注任务
 
 ## 三、界面说明
@@ -198,8 +213,8 @@ python main.py
 ## 七、技术支持
 
 ### 获取帮助
-- **项目维护**: [您的姓名]
-- **联系邮箱**: [您的邮箱]  
+- **项目维护**: 陈樟权，牛垚鑫，周启杨
+- **联系邮箱**: 1565850058@qq.com 
 - **项目地址**: [GitHub仓库链接]
 - **问题反馈**: 提交GitHub Issue
 
