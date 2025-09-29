@@ -52,6 +52,10 @@ pip install PyQt5 numpy pillow
     │       └── ... (图片文件)
     └── output/                    # 标注结果（程序自动创建）
 
+#下载训练图像
+通过链接https://huggingface.co/datasets/omlab/VLM-R1
+下载项目中的训练图像集 train2014.zip，解压缩并放至本地data目录下
+
 # 转换VLM-R1数据（如需）
 python convert_vlmr1_to_our_format.py
 
