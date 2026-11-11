@@ -1,0 +1,131 @@
+{
+  "sha256": "258d618a06487d6f80d4de903558fc52e488b26e9bb228ef1bcd509985e980af",
+  "records": 1144,
+  "unique_ids": 1144,
+  "unique_samples": 1144,
+  "events": 179204,
+  "event_types": {
+    "canvas_enter": 1513,
+    "hover_move": 130947,
+    "zoom_start": 2105,
+    "zoom_move": 21751,
+    "zoom_end": 2105,
+    "hover_end": 2670,
+    "canvas_leave": 1514,
+    "down": 1152,
+    "create_start": 1152,
+    "drag_move": 10573,
+    "create_end": 1152,
+    "up": 1152,
+    "hover_start": 1157,
+    "zoom_reset": 238,
+    "select_bbox": 4,
+    "edit_start": 4,
+    "edit_end": 4,
+    "delete_bbox": 2,
+    "edit_move": 9
+  },
+  "final_box_counts": {
+    "1": 1135,
+    "2": 8,
+    "0": 1
+  },
+  "sessions_with_negative_pointer": 245,
+  "sessions_with_zoom": 1143,
+  "sessions_with_edit": 3,
+  "difficulty_values": {
+    "medium": [
+      0.4,
+      0.5,
+      0.6
+    ],
+    "hard": [
+      0.67,
+      0.7,
+      0.8,
+      0.88,
+      0.9,
+      1.0
+    ],
+    "easy": [
+      0.2,
+      0.26,
+      0.3
+    ],
+    "ambiguous": [
+      null
+    ]
+  },
+  "seconds": {
+    "min": 5.47,
+    "median": 16.835,
+    "max": 148.4
+  },
+  "replay_box_count_mismatches": [
+    "visual_probe_train_1344_idx1264_v1"
+  ],
+  "final_minus_event_coordinate_deltas": {
+    "0": 2297,
+    "-1": 2299
+  },
+  "error_records": 0,
+  "warning_records": 8,
+  "issues": [
+    {
+      "id": "visual_probe_train_1175_idx1127_v1",
+      "errors": [],
+      "warnings": [
+        "框 0 零面积、倒置或越出原点"
+      ]
+    },
+    {
+      "id": "visual_probe_train_1344_idx1264_v1",
+      "errors": [],
+      "warnings": [
+        "框 1 零面积、倒置或越出原点"
+      ]
+    },
+    {
+      "id": "visual_probe_train_179_idx345_v1",
+      "errors": [],
+      "warnings": [
+        "没有最终证据框"
+      ]
+    },
+    {
+      "id": "visual_probe_train_339_idx300_v1",
+      "errors": [],
+      "warnings": [
+        "框 0 零面积、倒置或越出原点"
+      ]
+    },
+    {
+      "id": "visual_probe_train_442_idx399_v1",
+      "errors": [],
+      "warnings": [
+        "框 0 零面积、倒置或越出原点"
+      ]
+    },
+    {
+      "id": "visual_probe_train_481_idx527_v1",
+      "errors": [],
+      "warnings": [
+        "框 0 零面积、倒置或越出原点"
+      ]
+    },
+    {
+      "id": "visual_probe_train_77_idx18_v1",
+      "errors": [],
+      "warnings": [
+        "框 0 零面积、倒置或越出原点"
+      ]
+    },
+    {
+      "id": "visual_probe_train_791_idx966_v1",
+      "errors": [],
+      "warnings": [
+        "框 0 零面积、倒置或越出原点"
+      ]
+    }
+  ]
+}

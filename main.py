@@ -1,457 +1,463 @@
-import sys
-import os
+"""Human Search Traces annotation desktop application."""
+import argparse
 import json
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
-                             QWidget, QPushButton, QLabel, QScrollArea, QMessageBox,
-                             QFileDialog, QSizePolicy, QInputDialog, QDialog, QListWidget)
-from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QPixmap, QFont
-from data_processor import DataProcessor
+import sys
+from pathlib import Path
+
+from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtGui import QKeySequence, QPixmap
+from PyQt5.QtWidgets import (QApplication, QCheckBox, QDialog, QDialogButtonBox,
+    QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout, QInputDialog, QLabel,
+    QLineEdit, QMainWindow, QMessageBox, QPushButton, QScrollArea, QShortcut, QSlider,
+    QVBoxLayout, QWidget)
+
 from bbox_canvas import BBoxCanvas
+from data_processor import DataProcessor
+from session_store import DatasetWorkspace, SessionStore, atomic_json
+from tools.export_jsonl import export_sessions
+from trace_schema import evaluation, validate_record
+
+ROOT = Path(__file__).resolve().parent
 
 
-class StartDialog(QDialog):
-    """启动选择对话框"""
-
+class EvaluationDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("选择标注起点")
-        self.setGeometry(200, 200, 400, 300)
-
-        self.selected_id = None
-        self.start_index = 0
-        self.init_ui()
-
-    def init_ui(self):
-
+        self.setWindowTitle("提交前评价")
+        self.setMinimumWidth(420)
         layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("请评价本次搜索与证据。提交成功后显示参考答案。"))
+        form = QFormLayout()
+        self.difficulty = self.add_score(form, "搜索 / 定位难度", 0.5)
+        self.confidence = self.add_score(form, "证据正确性置信度", 1.0)
+        layout.addLayout(form)
+        self.ambiguous = QCheckBox("问题存在歧义（两项分数记为 null）")
+        self.ambiguous.toggled.connect(self.update_enabled)
+        layout.addWidget(self.ambiguous)
+        self.level = QLabel()
+        self.difficulty.valueChanged.connect(self.update_level)
+        self.update_level()
+        layout.addWidget(self.level)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("确认提交并显示答案")
+        buttons.button(QDialogButtonBox.Cancel).setText("返回标注")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
 
-        # 说明文字
-        info_label = QLabel("请选择标注起点（用于继续之前的标注工作）")
-        layout.addWidget(info_label)
+    def add_score(self, form, title, default):
+        widget = QWidget()
+        row = QHBoxLayout(widget)
+        row.setContentsMargins(0, 0, 0, 0)
+        slider = QSlider(Qt.Horizontal)
+        slider.setRange(0, 100)
+        slider.setValue(round(default * 100))
+        spin = QDoubleSpinBox()
+        spin.setRange(0, 1)
+        spin.setSingleStep(0.01)
+        spin.setDecimals(2)
+        spin.setValue(default)
+        slider.valueChanged.connect(lambda value: spin.setValue(value / 100))
+        spin.valueChanged.connect(lambda value: slider.setValue(round(value * 100)))
+        spin.slider_widget = slider
+        row.addWidget(slider, 1)
+        row.addWidget(spin)
+        form.addRow(title, widget)
+        return spin
 
-        # 选项按钮
-        start_from_beginning_btn = QPushButton("从开始处标注")
-        start_from_beginning_btn.clicked.connect(self.start_from_beginning)
-        layout.addWidget(start_from_beginning_btn)
+    def update_enabled(self, checked):
+        for spin in (self.difficulty, self.confidence):
+            spin.setEnabled(not checked)
+            spin.slider_widget.setEnabled(not checked)
+        self.update_level()
 
-        start_from_id_btn = QPushButton("从指定ID开始标注")
-        start_from_id_btn.clicked.connect(self.start_from_id)
-        layout.addWidget(start_from_id_btn)
+    def update_level(self):
+        grade = self.get_evaluation()
+        self.level.setText(f"难度等级：{grade['difficulty_level']}　（0.00–1.00，步长 0.01）")
 
-        start_from_index_btn = QPushButton("从指定序号开始标注")
-        start_from_index_btn.clicked.connect(self.start_from_index)
-        layout.addWidget(start_from_index_btn)
-
-        # 状态显示
-        self.status_label = QLabel("选择: 从开始处标注")
-        layout.addWidget(self.status_label)
-
-        # 确定按钮
-        confirm_btn = QPushButton("确定")
-        confirm_btn.clicked.connect(self.accept)
-        layout.addWidget(confirm_btn)
-
-    def start_from_beginning(self):
-        self.selected_id = None
-        self.start_index = 0
-        self.status_label.setText("选择: 从开始处标注")
-
-    def start_from_id(self):
-        id, ok = QInputDialog.getText(self, "输入ID", "请输入要开始的ID:")
-        if ok and id:
-            self.selected_id = id.strip()
-            self.start_index = 0  # 将在加载数据后查找
-            self.status_label.setText(f"选择: 从ID '{self.selected_id}' 开始")
-
-    def start_from_index(self):
-        index, ok = QInputDialog.getInt(self, "输入序号", "请输入要开始的序号(从0开始):", 0, 0, 100000, 1)
-        if ok:
-            self.start_index = index
-            self.selected_id = None
-            self.status_label.setText(f"选择: 从序号 {self.start_index} 开始")
+    def get_evaluation(self):
+        return evaluation(self.difficulty.value(), self.confidence.value(), self.ambiguous.isChecked())
 
 
 class AnnotationTool(QMainWindow):
-    def __init__(self, start_id=None, start_index=0):
+    def __init__(self, start_id=None, start_index=0, output_dir=None, images_root=None, review=False, dataset_name=None):
         super().__init__()
-        self.setWindowTitle("RLHF 数据标注工具")
-        self.setGeometry(100, 100, 1200, 800)
-
-        # 启动参数
-        self.start_id = start_id
-        self.start_index = start_index
-
-        # 数据处理器
+        self.setWindowTitle("Human Search Traces · 原图证据标注" + (" · 只读检查" if review else ""))
+        self.resize(1320, 880)
+        self.start_id, self.start_index = start_id, start_index
+        self.images_root = images_root
+        self.review = review
+        self.output_root = Path(output_dir or ROOT / "output").expanduser().resolve()
+        self.workspace = None
+        self.dataset_name = dataset_name
         self.data_processor = None
         self.current_image_path = None
-
-        # 输出目录
-        self.output_dir = "output"
-        os.makedirs(self.output_dir, exist_ok=True)
-
-        # 标注计数器 - 记录每张图片的标注次数
-        self.annotation_count = {}
-
-        # 已保存的标注记录
-        self.saved_annotations = set()
-
+        self.store = SessionStore(self.output_root)
+        self.completed = {}
+        self.draft_dirty = False
+        self.resumed_segments = 0
         self.init_ui()
+        self.draft_timer = QTimer(self)
+        self.draft_timer.timeout.connect(self.autosave_draft)
+        self.draft_timer.start(5000)
 
     def init_ui(self):
-        """初始化用户界面"""
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-
-        # 主布局
-        main_layout = QHBoxLayout(central_widget)
-
-        # 左侧控制面板
-        left_panel = QWidget()
-        left_panel.setFixedWidth(300)
-        left_layout = QVBoxLayout(left_panel)
-
-        # 文件加载按钮
-        load_btn = QPushButton("加载数据文件")
-        load_btn.clicked.connect(self.load_data_file)
-        left_layout.addWidget(load_btn)
-
-        # 图片信息显示
-        self.image_info_label = QLabel("请先加载数据文件")
-        self.image_info_label.setWordWrap(True)
-        self.image_info_label.setStyleSheet("background-color: #f0f0f0; padding: 10px; margin: 5px 0;")
-        left_layout.addWidget(self.image_info_label)
-
-        # 指令显示
-        instruction_label = QLabel("指令:")
-        instruction_label.setFont(QFont("Arial", 10, QFont.Bold))
-        left_layout.addWidget(instruction_label)
-
-        self.instruction_label = QLabel("无指令")
-        self.instruction_label.setWordWrap(True)
-        self.instruction_label.setStyleSheet("background-color: #e8f4fd; padding: 10px; margin: 5px 0;")
-        left_layout.addWidget(self.instruction_label)
-
-        # 导航按钮
-        nav_layout = QHBoxLayout()
-        self.prev_btn = QPushButton("上一张")
-        self.prev_btn.clicked.connect(self.prev_image)
-        self.prev_btn.setEnabled(False)
-
-        self.next_btn = QPushButton("下一张")
-        self.next_btn.clicked.connect(self.next_image)
-        self.next_btn.setEnabled(False)
-
-        nav_layout.addWidget(self.prev_btn)
-        nav_layout.addWidget(self.next_btn)
-        left_layout.addLayout(nav_layout)
-
-        # 标注控制按钮
-        self.save_btn = QPushButton("保存标注")
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QHBoxLayout(central)
+        sidebar = QWidget()
+        controls = QVBoxLayout(sidebar)
+        heading = QLabel("只读检查历史记录" if self.review else "原图证据标注")
+        heading.setStyleSheet("font-size: 22px; font-weight: 600; padding: 6px 0;")
+        controls.addWidget(heading)
+        self.dataset_name_input = QLineEdit(self.dataset_name or "")
+        self.dataset_name_input.setPlaceholderText("数据集名称（留空自动识别，加载前填写）")
+        self.dataset_name_input.setToolTip("用于输出文件夹名称；无 source_dataset 的任务也会使用此名称。")
+        controls.addWidget(self.dataset_name_input)
+        for title, callback in (("加载 JSON / JSONL", self.load_data_file),
+                                ("选择原图目录", self.choose_images),
+                                ("选择输出根目录", self.choose_output),
+                                ("导出当前数据集 JSONL", self.export_current)):
+            button = QPushButton(title)
+            button.clicked.connect(callback)
+            controls.addWidget(button)
+        self.image_info_label = self.label("请加载数据文件")
+        controls.addWidget(self.image_info_label)
+        controls.addWidget(QLabel("问题"))
+        self.instruction_label = self.label("尚未加载", "#eaf2fb")
+        self.instruction_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        controls.addWidget(self.instruction_label)
+        self.answer_label = self.label("参考答案：提交后显示", "#eef4ee")
+        controls.addWidget(self.answer_label)
+        nav = QHBoxLayout()
+        self.prev_btn = QPushButton("上一题")
+        self.prev_btn.clicked.connect(lambda: self.navigate(-1))
+        self.next_btn = QPushButton("下一题 / 跳过")
+        self.next_btn.clicked.connect(lambda: self.navigate(1))
+        nav.addWidget(self.prev_btn)
+        nav.addWidget(self.next_btn)
+        controls.addLayout(nav)
+        jump = QPushButton("跳转到序号 / ID")
+        jump.clicked.connect(self.jump_to)
+        controls.addWidget(jump)
+        self.save_btn = QPushButton("提交并评价（Ctrl / ⌘ + S）")
+        self.save_btn.setStyleSheet("QPushButton {background: #245e8a; color: white; padding: 12px; font-weight: 600;}"
+                                   "QPushButton:disabled {background: #d8dfe6; color: #667687;}")
         self.save_btn.clicked.connect(self.save_annotation)
-        self.save_btn.setEnabled(False)
-
-        self.clear_btn = QPushButton("清空标注")
+        controls.addWidget(self.save_btn)
+        self.reset_btn = QPushButton("恢复全图（R）")
+        self.reset_btn.clicked.connect(lambda: self.canvas.reset_view())
+        controls.addWidget(self.reset_btn)
+        self.delete_btn = QPushButton("删除选中框（Delete）")
+        self.delete_btn.clicked.connect(lambda: self.canvas.delete_selected_bbox())
+        controls.addWidget(self.delete_btn)
+        self.clear_btn = QPushButton("清空证据框（保留轨迹）")
         self.clear_btn.clicked.connect(self.clear_annotation)
-        self.clear_btn.setEnabled(False)
-
-        self.delete_btn = QPushButton("删除选中框 (Del)")
-        self.delete_btn.clicked.connect(self.delete_selected_bbox)
-        self.delete_btn.setEnabled(False)
-
-        left_layout.addWidget(self.save_btn)
-        left_layout.addWidget(self.clear_btn)
-        left_layout.addWidget(self.delete_btn)
-
-        # 帮助信息
-        help_label = QLabel("""
-使用说明:
-• 鼠标左键拖拽绘制边界框
-• 点击边界框选中，拖拽移动
-• 拖拽边界框角点调整大小
-• Delete键删除选中的边界框
-• 红色框表示当前选中的边界框
-        """)
-        help_label.setStyleSheet("background-color: #fff3cd; padding: 10px; margin: 10px 0;")
-        help_label.setWordWrap(True)
-        left_layout.addWidget(help_label)
-
-        left_layout.addStretch()
-
-        # 状态显示
-        self.status_label = QLabel("就绪")
-        self.status_label.setStyleSheet("background-color: #d1ecf1; padding: 5px;")
-        left_layout.addWidget(self.status_label)
-
-        # 右侧图像显示区域
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-
-        # 滚动区域
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setAlignment(Qt.AlignCenter)
-
-        # 画布
+        controls.addWidget(self.clear_btn)
+        controls.addWidget(self.label("左键拖动：标证据；右键拖动：放大区域\n"
+            "左键选框后拖动 / 拖角点：移动 / 调整\n"
+            "Shift + 左键：在已有框内新建框\n"
+            "Esc：取消当前拖动；R：恢复全图\n"
+            "提交后停留当前题；下一题随时可跳过\n"
+            "按钮点击与评分操作不采集鼠标轨迹。", "#fff6df"))
+        controls.addStretch()
+        self.status_label = self.label("就绪")
+        controls.addWidget(self.status_label)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(sidebar)
+        scroll.setMinimumWidth(330)
+        scroll.setMaximumWidth(390)
+        layout.addWidget(scroll)
+        right = QVBoxLayout()
+        self.view_label = QLabel("原始图像像素坐标")
+        right.addWidget(self.view_label)
         self.canvas = BBoxCanvas()
         self.canvas.contentChanged.connect(self.on_content_changed)
-        scroll_area.setWidget(self.canvas)
-
-        right_layout.addWidget(scroll_area)
-
-        # 添加到主布局
-        main_layout.addWidget(left_panel)
-        main_layout.addWidget(right_panel, 1)
-
-    def load_data_file(self):
-        """加载数据文件"""
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "选择数据文件", "", "JSON files (*.json)"
-        )
-
-        if file_path:
-            self.data_processor = DataProcessor(file_path)
-            if self.data_processor.load_data():
-                # 根据启动参数跳转到指定位置
-                self.jump_to_start_position()
-                self.update_ui_state()
-                self.load_current_image()
-                self.status_label.setText(f"已加载 {len(self.data_processor.data)} 条数据")
-            else:
-                QMessageBox.critical(self, "错误", "数据文件加载失败")
-
-    def jump_to_start_position(self):
-        """跳转到指定的起始位置"""
-        if self.start_id:
-            # 查找指定ID的位置
-            found = False
-            for i, item in enumerate(self.data_processor.data):
-                if item.get("id") == self.start_id:
-                    self.data_processor.current_index = i
-                    found = True
-                    self.status_label.setText(f"已跳转到ID: {self.start_id} (位置: {i})")
-                    break
-
-            if not found:
-                QMessageBox.warning(self, "警告", f"未找到ID: {self.start_id}，将从开始处标注")
-                self.data_processor.current_index = 0
-
-        elif self.start_index > 0:
-            # 跳转到指定索引
-            if self.start_index < len(self.data_processor.data):
-                self.data_processor.current_index = self.start_index
-                self.status_label.setText(f"已跳转到序号: {self.start_index}")
-            else:
-                QMessageBox.warning(self, "警告", f"序号 {self.start_index} 超出范围，将从最后一条数据开始")
-                self.data_processor.current_index = len(self.data_processor.data) - 1
-
-    def update_ui_state(self):
-        """更新UI状态"""
-        has_data = self.data_processor and len(self.data_processor.data) > 0
-
-        self.prev_btn.setEnabled(has_data and self.data_processor.current_index > 0)
-        self.next_btn.setEnabled(has_data and self.data_processor.current_index < len(self.data_processor.data) - 1)
-        self.save_btn.setEnabled(has_data)
-        self.clear_btn.setEnabled(has_data)
-        self.delete_btn.setEnabled(has_data)
-
-    def load_current_image(self):
-        """加载当前图片"""
-        if not self.data_processor:
-            return
-
-        item = self.data_processor.get_current_item()
-        if not item:
-            return
-
-        image_path = item.get("image", "")
-        instruction = item.get("instruction", "")
-
-        # 构建信息显示文本
-        info_text = f"图片 {self.data_processor.current_index + 1}/{len(self.data_processor.data)}\n"
-        info_text += f"ID: {item.get('id', 'N/A')}\n"
-        info_text += f"类型: {item.get('type', 'N/A')}\n"
-
-        # 如果是VLM-R1数据，显示额外信息
-        if item.get('original_format') == 'vlmr1' or item.get('type', '').startswith('vlmr1'):
-            info_text += "来源: VLM-R1数据集\n"
-            if item.get('original_bbox'):
-                info_text += f"原标注: {item['original_bbox']}\n"
-
-        self.image_info_label.setText(info_text)
-        self.instruction_label.setText(instruction)
-
-        # 其余代码保持不变...
-        # 加载图片部分...
-
-        # 加载图片
-        if os.path.exists(image_path):
-            pixmap = QPixmap(image_path)
-            if not pixmap.isNull():
-                # 缩放图片以适应显示
-                max_size = 800
-                if pixmap.width() > max_size or pixmap.height() > max_size:
-                    pixmap = pixmap.scaled(max_size, max_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-
-                self.canvas.set_image(pixmap)
-                self.current_image_path = image_path
-                self.status_label.setText(f"已加载图片: {os.path.basename(image_path)}")
-            else:
-                QMessageBox.warning(self, "警告", f"无法加载图片: {image_path}")
-        else:
-            QMessageBox.warning(self, "警告", f"图片文件不存在: {image_path}")
-
+        self.canvas.viewChanged.connect(self.update_view_info)
+        right.addWidget(self.canvas, 1)
+        layout.addLayout(right, 1)
+        QShortcut(QKeySequence.Save, self, activated=self.save_annotation)
+        QShortcut(QKeySequence("Alt+Right"), self, activated=lambda: self.navigate(1))
+        QShortcut(QKeySequence("Alt+Left"), self, activated=lambda: self.navigate(-1))
         self.update_ui_state()
 
-    def check_unsaved_changes(self):
-        """检查未保存的更改"""
-        if self.canvas.has_unsaved_changes():
-            reply = QMessageBox.question(
-                self, "未保存的更改",
-                "当前标注有未保存的更改，是否保存？",
-                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel
-            )
+    @staticmethod
+    def label(text, background="#f0f3f7"):
+        label = QLabel(text)
+        label.setTextFormat(Qt.PlainText)
+        label.setWordWrap(True)
+        label.setStyleSheet(f"background: {background}; color: #1e3042; padding: 10px;")
+        return label
 
-            if reply == QMessageBox.Yes:
-                self.save_annotation()
-                return True
-            elif reply == QMessageBox.No:
-                return True
-            else:  # Cancel
-                return False
+    def load_data_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "选择任务或记录文件", "", "JSON / JSONL (*.json *.jsonl)")
+        if path:
+            self.load_path(path)
+
+    def load_path(self, path):
+        # A different dataset must never silently inherit the previous image folder.
+        candidate = DataProcessor(path, self.images_root if self.data_processor is None else None)
+        if not candidate.load_data():
+            QMessageBox.critical(self, "数据加载失败", candidate.error)
+            return False
+        try:
+            workspace = DatasetWorkspace(self.output_root, candidate, self.dataset_name_input.text().strip() or None)
+        except (OSError, ValueError, TypeError) as exc:
+            QMessageBox.critical(self, "数据集输出目录无法建立", str(exc))
+            return False
+        if not self.persist_current():
+            return False
+        self.data_processor = candidate
+        self.workspace = workspace
+        self.store = workspace.store
+        self.completed = self.store.completed_records(candidate.data)
+        index = candidate.find_index_by_id(self.start_id) if self.start_id else self.start_index
+        if not 0 <= index < len(candidate.data):
+            QMessageBox.warning(self, "起点无效", "未找到指定 ID 或序号，已回到第 1 题。")
+            index = 0
+        candidate.current_index = index
+        self.load_current_image()
         return True
 
-    def prev_image(self):
-        """上一张图片"""
-        if not self.check_unsaved_changes():
+    def load_current_image(self):
+        self.current_image_path = None
+        self.canvas.clear_image()
+        self.draft_dirty = False
+        self.resumed_segments = 0
+        item = self.data_processor.get_current_item()
+        index = self.data_processor.current_index
+        self.instruction_label.setText(item["question"].replace("<image>", "").strip())
+        self.answer_label.setText("参考答案：提交后显示")
+        self.image_info_label.setText(f"第 {index + 1} / {len(self.data_processor.data)} 题（索引 {index}）\n"
+            f"{item['sample_id']}\n来源：{item['source_dataset']}\n输出：{self.workspace.path.name}/sessions")
+        self.image_info_label.setToolTip(str(self.store.output_dir))
+        path = self.data_processor.resolve_image()
+        pixmap = QPixmap(str(path)) if path else QPixmap()
+        if pixmap.isNull():
+            self.canvas.clear_image(f"找不到或无法解码原图：{item['image']}\n请选择原图目录，或点击下一题跳过。")
+            self.status_label.setText("当前题缺图，无法提交。上一题图像已清除。")
+            self.update_ui_state()
             return
+        self.current_image_path = path
+        self.canvas.set_image(pixmap)
+        record = item if self.review else self.completed.get(index)
+        if record is not None:
+            errors, warnings = validate_record(record)
+            if errors:
+                self.canvas.read_only = True
+                self.canvas.recorder.enabled = False
+                self.status_label.setText("历史记录无法检查：" + "；".join(errors[:3]))
+            else:
+                self.canvas.show_record(record)
+                self.answer_label.setText("参考答案：" + record["answer"])
+                self.status_label.setText(f"只读 · {len(record['events'])} 个事件 · {record['annotation_time']} 秒\n"
+                    f"评价：{record['task_evaluation']}" + ("\n提示：" + "；".join(warnings) if warnings else ""))
+        else:
+            draft_path = self.store.draft_path(self.data_processor.data_path, index)
+            self.status_label.setText("请阅读问题，然后在原图中搜索证据。答案将在提交后显示。")
+            if draft_path.exists():
+                try:
+                    draft = json.loads(draft_path.read_text(encoding="utf-8"))
+                    if draft["identity"] != self.identity():
+                        raise ValueError("任务内容已变化，未载入旧草稿")
+                    self.canvas.restore(draft["canvas"])
+                    self.resumed_segments = draft.get("resumed_segments", 0) + 1
+                    self.status_label.setText("已恢复未提交草稿；切题 / 关闭期间不计时。参考答案仍隐藏。")
+                except (OSError, ValueError, KeyError, TypeError) as exc:
+                    self.canvas.read_only = True
+                    self.canvas.recorder.enabled = False
+                    self.status_label.setText(f"草稿需要检查，已禁止覆盖：{exc}\n{draft_path}")
+        self.update_view_info()
+        self.update_ui_state()
 
-        if self.data_processor and self.data_processor.prev_item():
+    def identity(self):
+        item = self.data_processor.get_current_item()
+        return {key: item[key] for key in ("sample_id", "question", "image")}
+
+    def autosave_draft(self):
+        if not self.draft_dirty or self.canvas.operation or self.canvas.read_only or not self.current_image_path:
+            return True
+        try:
+            path = self.store.draft_path(self.data_processor.data_path, self.data_processor.current_index)
+            atomic_json(path, dict(identity=self.identity(), canvas=self.canvas.snapshot(),
+                                   resumed_segments=self.resumed_segments))
+            self.draft_dirty = False
+            return True
+        except (OSError, ValueError) as exc:
+            self.status_label.setText(f"草稿保存失败：{exc}")
+            return False
+
+    def persist_current(self):
+        if not self.data_processor or not self.current_image_path or self.canvas.read_only:
+            return True
+        self.canvas.freeze()
+        if not self.autosave_draft():
+            QMessageBox.warning(self, "草稿未保存", "草稿写入失败，当前题保持打开。请检查输出目录权限或磁盘空间。")
+            self.canvas.unfreeze()
+            return False
+        return True
+
+    def navigate(self, delta):
+        if not self.data_processor:
+            return
+        target = self.data_processor.current_index + delta
+        if 0 <= target < len(self.data_processor.data) and self.persist_current():
+            self.data_processor.current_index = target
             self.load_current_image()
 
-    def next_image(self):
-        """下一张图片"""
-        if not self.check_unsaved_changes():
+    def jump_to(self):
+        if not self.data_processor:
             return
+        value, ok = QInputDialog.getText(self, "跳转", "输入从 1 开始的题号，或 sample_id / session id：")
+        if not ok:
+            return
+        target = int(value) - 1 if value.isdigit() else self.data_processor.find_index_by_id(value.strip())
+        if 0 <= target < len(self.data_processor.data):
+            self.navigate(target - self.data_processor.current_index)
+        else:
+            QMessageBox.warning(self, "无法跳转", "序号超出范围或 ID 不存在。")
 
-        if self.data_processor and self.data_processor.next_item():
-            self.load_current_image()
+    def choose_images(self):
+        path = QFileDialog.getExistingDirectory(self, "选择包含原图的目录")
+        if path and self.persist_current():
+            if self.data_processor:
+                self.data_processor.images_root = Path(path)
+                try:
+                    self.workspace.write_manifest(self.data_processor)
+                except OSError as exc:
+                    QMessageBox.warning(self, "原图目录未持久保存", str(exc))
+                self.load_current_image()
+            else:
+                self.images_root = path
+
+    def choose_output(self):
+        path = QFileDialog.getExistingDirectory(self, "选择标注输出根目录（各数据集自动分文件夹）", str(self.output_root))
+        if path and self.persist_current():
+            try:
+                if self.data_processor:
+                    workspace = DatasetWorkspace(path, self.data_processor, self.workspace.name)
+                    self.workspace = workspace
+                    self.store = workspace.store
+                    self.completed = self.store.completed_records(self.data_processor.data)
+                    self.load_current_image()
+                else:
+                    self.store = SessionStore(path)
+                self.output_root = Path(path).resolve()
+            except (OSError, ValueError, TypeError) as exc:
+                QMessageBox.critical(self, "输出目录不可用", str(exc))
+                self.canvas.unfreeze()
+
+    def export_current(self):
+        if not self.workspace:
+            return
+        folder = self.workspace.path / "exports"
+        path, _ = QFileDialog.getSaveFileName(self, "导出所有已提交会话（不含草稿）", str(folder / "sessions.jsonl"), "JSONL (*.jsonl)")
+        if path:
+            try:
+                count = export_sessions(self.store.output_dir, path)
+            except (OSError, ValueError) as exc:
+                QMessageBox.warning(self, "导出未完成", str(exc))
+                return
+            QMessageBox.information(self, "导出完成", f"已导出 {count} 个独立会话。\n{path}")
 
     def save_annotation(self):
-        """保存标注结果"""
-        if not self.data_processor or not self.current_image_path:
-            return
+        if not self.data_processor or not self.current_image_path or self.canvas.read_only or self.canvas.operation:
+            return False
+        self.canvas.freeze()
+        if not self.canvas.bboxes:
+            reply = QMessageBox.question(self, "提交空框记录", "当前没有证据框。仍然提交本次搜索记录？",
+                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                self.canvas.unfreeze()
+                return False
+        dialog = EvaluationDialog(self)
+        if dialog.exec_() != QDialog.Accepted:
+            self.canvas.unfreeze()
+            return False
+        return self.commit_submission(dialog.get_evaluation())
 
-        item = self.data_processor.get_current_item()
-        if not item:
-            return
-
-        # 如果没有边界框，询问是否保存空标注
-        if len(self.canvas.bboxes) == 0:
-            reply = QMessageBox.question(
-                self, "空标注", "没有标注内容，是否保存空标注？",
-                QMessageBox.Yes | QMessageBox.No
-            )
-            if reply == QMessageBox.No:
-                return
-
-        # 获取事件列表
-        events = self.canvas.get_events()
-
-        # 正确计算标注时间（基于实际时间戳）
-        annotation_time = 0
-        if events:
-            # 使用最后一个事件的时间戳（毫秒）转换为秒
-            annotation_time = events[-1]["t"] / 1000.0
-
-        # 准备输出数据
-        output_data = {
-            "id": item.get("id", ""),
-            "image": item.get("image", ""),
-            "instruction": item.get("instruction", ""),
-            "type": item.get("type", ""),
-            "final_bboxes": self.canvas.get_final_bboxes(),
-            "events": events,
-            "annotation_time": round(annotation_time, 2),  # 保留2位小数
-            "source_format": "vlmr1" if item.get('original_format') == 'vlmr1' or item.get('type', '').startswith(
-                'vlmr1') else "standard"
-        }
-
-        # 如果是VLM-R1数据，保存原始信息
-        if item.get('original_format') == 'vlmr1' or item.get('type', '').startswith('vlmr1'):
-            output_data.update({
-                "original_bbox": item.get('original_bbox', []),
-                "original_response": item.get('original_response', '')
-            })
-
-        # 获取图片ID和当前索引
-        image_id = item.get("id", "unknown")
-        current_index = self.data_processor.current_index
-
-        # 生成唯一的标注标识
-        annotation_key = f"{image_id}_{current_index}"
-
-        # 更新标注计数器
-        if annotation_key not in self.annotation_count:
-            self.annotation_count[annotation_key] = 1
-        else:
-            self.annotation_count[annotation_key] += 1
-
-        # 使用唯一标识符生成文件名
-        output_filename = f"{image_id}_idx{current_index}_v{self.annotation_count[annotation_key]}.json"
-        output_path = os.path.join(self.output_dir, output_filename)
-
+    def commit_submission(self, grade):
+        """Called only after the user confirms their evaluation."""
+        if not self.current_image_path or self.canvas.read_only or self.canvas.operation:
+            return False
         try:
-            with open(output_path, 'w', encoding='utf-8') as f:
-                json.dump(output_data, f, indent=2, ensure_ascii=False)
-
-            # 记录保存状态
-            self.saved_annotations.add(annotation_key)
-            self.canvas.reset_changes()
-
-            self.status_label.setText(f"标注已保存: {output_filename}")
-            QMessageBox.information(self, "成功", f"标注已保存到: {output_filename}")
-
-        except Exception as e:
-            QMessageBox.critical(self, "错误", f"保存失败: {e}")
-            self.status_label.setText("保存失败")
+            index = self.data_processor.current_index
+            path, record = self.store.save(self.data_processor.get_current_item(), index,
+                self.canvas.get_final_bboxes(), self.canvas.get_events(), grade)
+        except (OSError, ValueError) as exc:
+            QMessageBox.critical(self, "提交失败", f"答案仍隐藏，当前题未切换。\n{exc}")
+            self.canvas.unfreeze()
+            return False
+        self.completed[index] = record
+        self.canvas.show_record(record)
+        self.draft_dirty = False
+        self.answer_label.setText("参考答案：" + record["answer"])
+        self.status_label.setText(f"已提交：{path.name}\n{record['annotation_time']} 秒 · {len(record['events'])} 个事件\n"
+                                  "当前记录已锁定；点击下一题继续。")
+        try:
+            self.store.draft_path(self.data_processor.data_path, index).unlink(missing_ok=True)
+            atomic_json(self.store.state_dir / ".metadata" / path.name,
+                        dict(tool_version="2.0.0", resumed_segments=self.resumed_segments,
+                             image_size=[self.canvas.image.width(), self.canvas.image.height()]))
+        except OSError as exc:
+            self.status_label.setText(self.status_label.text() + f"\n已保存，但本地辅助信息未更新：{exc}")
+        self.update_ui_state()
+        return True
 
     def clear_annotation(self):
-        """清空标注"""
-        reply = QMessageBox.question(
-            self, "确认清空", "确定要清空所有标注吗？",
-            QMessageBox.Yes | QMessageBox.No
-        )
-
-        if reply == QMessageBox.Yes:
+        if not self.canvas.bboxes or self.canvas.read_only:
+            return
+        if QMessageBox.question(self, "清空证据框", "删除全部证据框？已记录的搜索和操作轨迹会保留。",
+                                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes:
             self.canvas.clear_canvas()
-            self.status_label.setText("标注已清空")
-
-    def delete_selected_bbox(self):
-        """删除选中的边界框"""
-        self.canvas.delete_selected_bbox()
 
     def on_content_changed(self):
-        """内容变化时的处理"""
-        # 可以在这里添加自动保存或其他逻辑
-        pass
+        if not self.canvas.read_only:
+            self.draft_dirty = True
+        self.update_view_info()
+
+    def update_view_info(self):
+        if self.canvas.image.isNull():
+            self.view_label.setText("等待原图")
+        else:
+            scale, _ = self.canvas.mapping()
+            self.view_label.setText(f"原图 {self.canvas.image.width()} × {self.canvas.image.height()} px　"
+                f"显示比例 {scale:.1%}　证据框 {len(self.canvas.bboxes)}　事件 {len(self.canvas.events)}")
+
+    def update_ui_state(self):
+        loaded = self.data_processor is not None
+        valid = bool(loaded and self.current_image_path)
+        editable = valid and not self.canvas.read_only
+        self.prev_btn.setEnabled(loaded and self.data_processor.current_index > 0)
+        self.next_btn.setEnabled(loaded and self.data_processor.current_index + 1 < len(self.data_processor.data))
+        for button in (self.save_btn, self.clear_btn, self.delete_btn):
+            button.setEnabled(editable)
+        self.reset_btn.setEnabled(valid)
+
+    def closeEvent(self, event):
+        if self.persist_current():
+            event.accept()
+        else:
+            event.ignore()
 
 
 def main():
-    app = QApplication(sys.argv)
-
-    # 显示启动选择对话框
-    start_dialog = StartDialog()
-    if start_dialog.exec_() == QDialog.Accepted:
-        # 创建主窗口并传递启动参数
-        window = AnnotationTool(
-            start_id=start_dialog.selected_id,
-            start_index=start_dialog.start_index
-        )
-        window.show()
-        sys.exit(app.exec_())
-    else:
-        sys.exit(0)
+    parser = argparse.ArgumentParser(description="Human Search Traces 原图证据标注工具")
+    parser.add_argument("--data", type=Path, help="JSON / JSONL 任务文件")
+    parser.add_argument("--images-root", type=Path, help="原图目录")
+    parser.add_argument("--output", type=Path, default=ROOT / "output")
+    parser.add_argument("--start-index", type=int, default=0, help="从 0 开始的任务索引")
+    parser.add_argument("--start-id", help="起始 sample_id / session id")
+    parser.add_argument("--review", action="store_true", help="只读检查已有记录；显示答案与最终框，不采集新轨迹")
+    parser.add_argument("--dataset-name", help="数据集输出文件夹的可读名称；留空从来源或任务文件自动识别")
+    args = parser.parse_args()
+    app = QApplication(sys.argv[:1])
+    window = AnnotationTool(args.start_id, args.start_index, args.output, args.images_root, args.review, args.dataset_name)
+    window.show()
+    if args.data:
+        window.load_path(args.data)
+    sys.exit(app.exec_())
 
 
 if __name__ == "__main__":

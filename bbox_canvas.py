@@ -1,519 +1,386 @@
-import json
-import time
-import numpy as np
-from PyQt5.QtWidgets import QWidget, QLabel
-from PyQt5.QtCore import Qt, QPoint, QRect, pyqtSignal
-from PyQt5.QtGui import QPainter, QPen, QColor, QPixmap
+"""Original-resolution image canvas with explicit image/view transformations."""
+import copy
+
+from PyQt5.QtCore import Qt, QPointF, QRectF, pyqtSignal
+from PyQt5.QtGui import QColor, QCursor, QPainter, QPen, QPixmap
+from PyQt5.QtWidgets import QWidget
+
+from trace_recorder import TraceRecorder
 
 
-class BBoxCanvas(QLabel):
-    # 信号：当有框变换时发出
-    boxTransformed = pyqtSignal(dict)
+def box_values(rect):
+    rect = rect.normalized()
+    return [round(rect.left()), round(rect.top()), round(rect.right()), round(rect.bottom())]
+
+
+def rect_from_box(box):
+    return QRectF(QPointF(box[0], box[1]), QPointF(box[2], box[3])).normalized()
+
+
+class BBoxCanvas(QWidget):
     contentChanged = pyqtSignal()
+    boxTransformed = pyqtSignal(dict)
+    viewChanged = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMouseTracking(True)
-        self.setAlignment(Qt.AlignTop)
-
-        # 状态变量
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setMinimumSize(360, 280)
+        self.image = QPixmap()
+        self.view_rect = QRectF()
         self.bboxes = []
-        self.current_bbox = None
-        self.drawing = False
-        self.resizing = False
-        self.moving = False
+        self.recorder = TraceRecorder()
         self.selected_bbox_index = -1
-        self.resize_corner = None
-
-        # 事件记录
-        self.events = []
-        self.last_mouse_pos = None
-        self.start_time = None
-        self.last_event_time = None
-        self.last_velocity = 0
-
-        # 移动相关的变量
-        self.move_start_pos = None
-        self.move_start_bbox = None
-
-        # 样式
-        self.bbox_color = QColor(0, 255, 0)
-        self.selected_bbox_color = QColor(255, 0, 0)
-        self.pen_width = 2
-
-        # 内容变化标记
+        self.operation = None
+        self.preview = None
+        self.last_pos = None
+        self.mouse_in_canvas = False
+        self.hovering = False
         self.has_changes = False
+        self.read_only = False
+        self.message = "请加载数据文件并选择原图目录"
 
-        # 时间间隔控制
-        self.last_record_time = 0
-        self.record_interval = 0.1
+    @property
+    def events(self):
+        return self.recorder.events
 
-        # 悬停记录相关变量
-        self.last_hover_pos = None
-        self.hover_start_time = None
-        self.hover_record_interval = 0.2
-        self.last_hover_record_time = 0
-        self.is_hovering = False
-
-        # 新增：画布状态跟踪
-        self.mouse_in_canvas = False  # 鼠标是否在画布内
-        self.last_canvas_enter_time = None  # 上次进入画布时间
+    @property
+    def image_rect(self):
+        return QRectF(0, 0, self.image.width(), self.image.height())
 
     def set_image(self, pixmap):
-        """设置图片"""
-        self.setPixmap(pixmap)
-        self.clear_canvas()
-
-    def clear_canvas(self):
-        """清空画布"""
+        self.image = QPixmap(pixmap)  # Never downsample the source buffer.
         self.bboxes = []
-        self.events = []
-        self.current_bbox = None
+        self.recorder = TraceRecorder()
         self.selected_bbox_index = -1
-        self.drawing = False
-        self.resizing = False
-        self.moving = False
-        self.resize_corner = None
-        self.last_mouse_pos = None
-        self.start_time = None
-        self.last_event_time = None
-        self.last_velocity = 0
-        self.move_start_pos = None
-        self.move_start_bbox = None
-        self.last_record_time = 0
-        self.has_changes = False
+        self.operation = self.preview = self.last_pos = None
+        self.mouse_in_canvas = self.hovering = self.has_changes = False
+        self.read_only = False
+        self.view_rect = self.image_rect
+        self.update()
+        self.viewChanged.emit()
 
-        # 清空悬停状态
-        self.last_hover_pos = None
-        self.hover_start_time = None
-        self.last_hover_record_time = 0
-        self.is_hovering = False
+    def clear_image(self, message="图片不可用，请选择原图目录或跳到下一题"):
+        self.set_image(QPixmap())
+        self.message = message
+        self.update()
 
-        # 新增：重置画布状态
-        self.mouse_in_canvas = False
-        self.last_canvas_enter_time = None
+    def mapping(self):
+        if self.image.isNull() or self.view_rect.isEmpty():
+            return 1.0, QPointF()
+        scale = min(self.width() / self.view_rect.width(), self.height() / self.view_rect.height())
+        offset = QPointF((self.width() - self.view_rect.width() * scale) / 2,
+                         (self.height() - self.view_rect.height() * scale) / 2)
+        return scale, offset
 
-    def mark_content_changed(self):
-        """标记内容已变化"""
-        if not self.has_changes:
+    def to_image(self, pos, clamp=False):
+        scale, offset = self.mapping()
+        point = (QPointF(pos) - offset) / scale + self.view_rect.topLeft()
+        if clamp:
+            point.setX(max(0, min(self.image.width(), point.x())))
+            point.setY(max(0, min(self.image.height(), point.y())))
+        return point
+
+    def to_widget(self, point):
+        scale, offset = self.mapping()
+        return (QPointF(point) - self.view_rect.topLeft()) * scale + offset
+
+    def emit_event(self, kind, pos=None, **fields):
+        event = self.recorder.record(kind, pos, **fields)
+        if event:
             self.has_changes = True
             self.contentChanged.emit()
-
-    def reset_changes(self):
-        """重置变化标记"""
-        self.has_changes = False
-
-    def record_event(self, event_type, pos=None, bbox_data=None, category="drag"):
-        """记录鼠标事件"""
-        current_time = time.time()
-
-        # 初始化开始时间
-        if self.start_time is None:
-            self.start_time = current_time
-
-        # 使用相对时间戳（毫秒）
-        relative_time = (current_time - self.start_time) * 1000
-
-        # 计算速度和加速度（仅对移动事件）
-        velocity = 0
-        acceleration = 0
-
-        if pos and self.last_event_time is not None:
-            time_diff = current_time - self.last_event_time
-            if time_diff > 0.01:  # 至少10ms间隔才记录
-                if self.last_mouse_pos:
-                    dx = pos.x() - self.last_mouse_pos.x()
-                    dy = pos.y() - self.last_mouse_pos.y()
-                    distance = np.sqrt(dx ** 2 + dy ** 2)
-                    current_velocity = distance / time_diff
-
-                    # 计算加速度
-                    acceleration = (current_velocity - self.last_velocity) / time_diff
-                    velocity = current_velocity
-                    self.last_velocity = current_velocity
-
-        event = {
-            "type": event_type,
-            "t": round(relative_time, 1),
-            "v": round(velocity, 2),
-            "a": round(acceleration, 2),
-            "category": category
-        }
-
-        # 添加位置信息（如果有）
-        if pos:
-            event["x"] = pos.x()
-            event["y"] = pos.y()
-
-        if bbox_data:
-            event["bbox"] = bbox_data
-
-        self.events.append(event)
-
-        # 更新最后位置和时间（仅对移动事件）
-        if pos:
-            self.last_mouse_pos = QPoint(pos.x(), pos.y())
-            self.last_event_time = current_time
-
         return event
 
-    def record_hover_event(self, event_type, pos):
-        """专门记录悬停事件"""
-        if self.drawing or self.moving or self.resizing:
-            return
+    def ensure_enter(self, pos):
+        if not self.mouse_in_canvas:
+            self.emit_event("canvas_enter", pos)
+            self.mouse_in_canvas = True
 
-        current_time = time.time()
+    def end_hover(self, pos):
+        if self.hovering:
+            self.emit_event("hover_end", pos)
+            self.hovering = False
 
-        if self.start_time is None:
-            self.start_time = current_time
-
-        relative_time = (current_time - self.start_time) * 1000
-
-        # 计算速度
-        velocity = 0
-        if self.last_hover_pos:
-            dx = pos.x() - self.last_hover_pos.x()
-            dy = pos.y() - self.last_hover_pos.y()
-            distance = np.sqrt(dx ** 2 + dy ** 2)
-            time_diff = current_time - self.last_hover_record_time
-            if time_diff > 0.01:
-                velocity = distance / time_diff
-
-        event = {
-            "type": event_type,
-            "x": pos.x(),
-            "y": pos.y(),
-            "t": round(relative_time, 1),
-            "v": round(velocity, 2),
-            "a": 0,
-            "category": "hover"
-        }
-
-        self.events.append(event)
-        self.last_hover_pos = QPoint(pos.x(), pos.y())
-        self.last_hover_record_time = current_time
-
-    # 新增：画布进入/离开事件
     def enterEvent(self, event):
-        """鼠标进入画布事件"""
-        pos = event.pos()
-        current_time = time.time()
-
-        # 记录进入事件
-        self.record_event("canvas_enter", pos, category="canvas")
-
-        # 更新状态
-        self.mouse_in_canvas = True
-        self.last_canvas_enter_time = current_time
-
-        # 如果之前有悬停未结束，记录一个虚拟的结束（容错处理）
-        if self.is_hovering and not (self.drawing or self.moving or self.resizing):
-            self.record_hover_event("hover_end", pos)
-            self.is_hovering = False
-
+        if not self.image.isNull() and not self.read_only:
+            point = self.to_image(self.mapFromGlobal(QCursor.pos()))
+            self.ensure_enter(point)
+            self.last_pos = point
         super().enterEvent(event)
 
     def leaveEvent(self, event):
-        """鼠标离开画布事件"""
-        # 获取离开时的位置（近似值）
-        pos = self.last_mouse_pos if self.last_mouse_pos else QPoint(0, 0)
-
-        # 记录离开事件
-        self.record_event("canvas_leave", pos, category="canvas")
-
-        # 计算在画布内停留的时间
-        stay_duration = 0
-        if self.last_canvas_enter_time:
-            stay_duration = round((time.time() - self.last_canvas_enter_time) * 1000, 1)  # 毫秒
-
-        # 添加停留时间信息到离开事件
-        if self.events and self.events[-1]["type"] == "canvas_leave":
-            self.events[-1]["stay_duration"] = stay_duration
-
-        # 更新状态
-        self.mouse_in_canvas = False
-        self.last_canvas_enter_time = None
-
-        # 结束当前的悬停状态
-        if self.is_hovering:
-            self.record_hover_event("hover_end", pos)
-            self.is_hovering = False
-
+        if not self.image.isNull() and not self.read_only and self.mouse_in_canvas:
+            self.end_hover(self.last_pos)
+            self.emit_event("canvas_leave", self.last_pos)
+            self.mouse_in_canvas = False
+            self.recorder.reset_motion()
         super().leaveEvent(event)
 
-    def get_nearby_corner(self, pos, bbox):
-        """检查鼠标是否靠近bbox的角点"""
-        corners = [
-            (bbox.left(), bbox.top(), "top_left"),
-            (bbox.right(), bbox.top(), "top_right"),
-            (bbox.left(), bbox.bottom(), "bottom_left"),
-            (bbox.right(), bbox.bottom(), "bottom_right")
-        ]
-
-        threshold = 8
-
-        for x, y, corner_type in corners:
-            if abs(pos.x() - x) < threshold and abs(pos.y() - y) < threshold:
-                return corner_type
-
-        return None
+    def hit_test(self, widget_pos):
+        # Test all handles before interiors so small or overlapping boxes work.
+        for i in reversed(range(len(self.bboxes))):
+            box = self.bboxes[i]
+            for name, point in (("tl", box.topLeft()), ("tr", box.topRight()),
+                                ("bl", box.bottomLeft()), ("br", box.bottomRight())):
+                delta = self.to_widget(point) - QPointF(widget_pos)
+                if abs(delta.x()) <= 7 and abs(delta.y()) <= 7:
+                    return i, name
+        point = self.to_image(widget_pos)
+        for i in reversed(range(len(self.bboxes))):
+            if self.bboxes[i].contains(point):
+                return i, None
+        return -1, None
 
     def mousePressEvent(self, event):
-        """鼠标按下事件"""
-        if event.button() == Qt.LeftButton:
-            pos = event.pos()
+        if self.image.isNull() or self.operation or event.button() not in (Qt.LeftButton, Qt.RightButton):
+            return
+        if self.read_only and event.button() == Qt.LeftButton:
+            return
+        self.setFocus()
+        raw = self.to_image(event.pos())
+        if not self.view_rect.contains(raw):
+            return
+        pos = self.to_image(event.pos(), clamp=True)
+        self.ensure_enter(raw)
+        self.end_hover(raw)
+        self.recorder.reset_motion()
+        self.last_pos = raw
+        self.anchor = pos
+        self.anchor_widget = QPointF(event.pos())
+        if event.button() == Qt.RightButton:
+            self.operation = "zoom"
+            self.preview = QRectF(pos, pos)
+            self.emit_event("zoom_start", raw)
+        else:
+            index, handle = self.hit_test(event.pos()) if not event.modifiers() & Qt.ShiftModifier else (-1, None)
+            self.selected_bbox_index = index
+            if index >= 0:
+                self.operation = "edit"
+                self.before = QRectF(self.bboxes[index])
+                self.handle = handle
+                self.mode = "resize" if handle else "move"
+                self.emit_event("select_bbox", raw, index=index, bbox=box_values(self.before))
+                self.emit_event("edit_start", raw, **self.edit_fields())
+            else:
+                self.operation = "create"
+                self.selected_bbox_index = len(self.bboxes)
+                self.preview = QRectF(pos, pos)
+                self.emit_event("down", raw)
+                self.emit_event("create_start", raw, bbox={"index": self.selected_bbox_index})
+        self.update()
 
-            # 确保鼠标在画布内（安全检查）
-            if not self.mouse_in_canvas:
-                self.mouse_in_canvas = True
-                # 记录一个进入事件（补救措施）
-                self.record_event("canvas_enter", pos, category="canvas")
+    def edit_fields(self):
+        return dict(index=self.selected_bbox_index, mode=self.mode, handle=self.handle,
+                    bbox=box_values(self.bboxes[self.selected_bbox_index]))
 
-            # 记录悬停结束
-            if self.is_hovering:
-                self.record_hover_event("hover_end", pos)
-                self.is_hovering = False
-
-            self.record_event("down", pos)
-
-            # 检查是否选中了现有的bbox
-            self.selected_bbox_index = -1
-            for i, bbox in enumerate(self.bboxes):
-                if bbox.contains(pos):
-                    self.selected_bbox_index = i
-                    self.current_bbox = bbox
-
-                    # 检查是否靠近角点（调整大小）
-                    self.resize_corner = self.get_nearby_corner(pos, bbox)
-                    if self.resize_corner:
-                        self.resizing = True
-                        self.record_event("resize_start", pos, {
-                            "index": i,
-                            "corner": self.resize_corner,
-                            "before": [bbox.left(), bbox.top(), bbox.right(), bbox.bottom()]
-                        })
-                    else:
-                        self.moving = True
-                        self.move_start_pos = pos
-                        self.move_start_bbox = QRect(bbox)
-                        self.record_event("move_start", pos, {
-                            "index": i,
-                            "before": [bbox.left(), bbox.top(), bbox.right(), bbox.bottom()]
-                        })
-                    break
-
-            # 如果没有选中任何bbox，开始绘制新bbox
-            if self.selected_bbox_index == -1:
-                self.drawing = True
-                self.current_bbox = QRect(pos, pos)
-                self.bboxes.append(self.current_bbox)
-                self.selected_bbox_index = len(self.bboxes) - 1
-
-                self.record_event("create_start", pos, {
-                    "index": self.selected_bbox_index,
-                    "before": None
-                })
-
-            self.mark_content_changed()
-            self.update()
+    def update_operation(self, pos):
+        if self.operation in ("create", "zoom"):
+            self.preview = QRectF(self.anchor, pos).normalized()
+        elif self.operation == "edit":
+            box = QRectF(self.before)
+            if self.mode == "move":
+                delta = pos - self.anchor
+                dx = max(-box.left(), min(self.image.width() - box.right(), delta.x()))
+                dy = max(-box.top(), min(self.image.height() - box.bottom(), delta.y()))
+                box.translate(dx, dy)
+            else:
+                opposite = {"tl": box.bottomRight(), "tr": box.bottomLeft(),
+                            "bl": box.topRight(), "br": box.topLeft()}[self.handle]
+                box = QRectF(pos, opposite).normalized().intersected(self.image_rect)
+            self.bboxes[self.selected_bbox_index] = box
 
     def mouseMoveEvent(self, event):
-        """鼠标移动事件"""
-        pos = event.pos()
-        current_time = time.time()
-
-        # 更新光标形状
-        cursor_shape = Qt.ArrowCursor
-        if not (self.drawing or self.moving or self.resizing):
-            for i, bbox in enumerate(self.bboxes):
-                corner = self.get_nearby_corner(pos, bbox)
-                if corner:
-                    if corner in ["top_left", "bottom_right"]:
-                        cursor_shape = Qt.SizeFDiagCursor
-                    elif corner in ["top_right", "bottom_left"]:
-                        cursor_shape = Qt.SizeBDiagCursor
-                    break
-
-                if bbox.contains(pos):
-                    cursor_shape = Qt.SizeAllCursor
-                    break
-
-        self.setCursor(cursor_shape)
-
-        # 记录悬停移动事件
-        if not (self.drawing or self.moving or self.resizing):
-            if not self.is_hovering:
-                self.record_hover_event("hover_start", pos)
-                self.is_hovering = True
-                self.hover_start_time = current_time
-
-            if current_time - self.last_hover_record_time >= self.hover_record_interval:
-                self.record_hover_event("hover_move", pos)
-                self.last_hover_record_time = current_time
-
-        # 处理绘制、移动或调整大小
-        if self.drawing and self.current_bbox:
-            self.current_bbox.setBottomRight(pos)
-
-        elif self.moving and self.current_bbox and self.move_start_pos:
-            dx = pos.x() - self.move_start_pos.x()
-            dy = pos.y() - self.move_start_pos.y()
-            new_bbox = QRect(self.move_start_bbox)
-            new_bbox.translate(dx, dy)
-            self.current_bbox.setRect(new_bbox.x(), new_bbox.y(), new_bbox.width(), new_bbox.height())
-
-        elif self.resizing and self.current_bbox:
-            if self.resize_corner == "top_left":
-                self.current_bbox.setTopLeft(pos)
-            elif self.resize_corner == "top_right":
-                self.current_bbox.setTopRight(pos)
-            elif self.resize_corner == "bottom_left":
-                self.current_bbox.setBottomLeft(pos)
-            elif self.resize_corner == "bottom_right":
-                self.current_bbox.setBottomRight(pos)
-
-        # 每100ms记录一次移动事件
-        if (self.drawing or self.moving or self.resizing) and self.current_bbox:
-            if current_time - self.last_record_time >= self.record_interval:
-                self.record_event("drag_move", pos, category="drag")
-                self.last_record_time = current_time
-
+        if self.image.isNull():
+            return
+        raw = self.to_image(event.pos())
+        self.last_pos = raw
+        if not self.read_only:
+            self.ensure_enter(raw)
+        if self.operation:
+            self.update_operation(self.to_image(event.pos(), clamp=True))
+            if self.operation == "zoom":
+                self.emit_event("zoom_move", raw, bbox=box_values(self.preview))
+            elif self.operation == "create":
+                self.emit_event("drag_move", raw, bbox={"bbox": box_values(self.preview), "index": self.selected_bbox_index})
+            else:
+                self.emit_event("edit_move", raw, **self.edit_fields())
+        elif not self.read_only:
+            if not self.hovering and self.events and self.events[-1]["type"] == "up":
+                self.emit_event("hover_start", raw)
+            self.hovering = True
+            self.emit_event("hover_move", raw)
+            index, handle = self.hit_test(event.pos())
+            self.setCursor(Qt.SizeFDiagCursor if handle in ("tl", "br") else
+                           Qt.SizeBDiagCursor if handle else Qt.SizeAllCursor if index >= 0 else Qt.CrossCursor)
         self.update()
 
     def mouseReleaseEvent(self, event):
-        """鼠标释放事件"""
-        if event.button() == Qt.LeftButton:
-            pos = event.pos()
+        if not self.operation:
+            return
+        if (self.operation == "zoom") != (event.button() == Qt.RightButton):
+            return
+        pos = self.to_image(event.pos(), clamp=True)
+        self.update_operation(pos)  # Release position may differ from last move.
+        if self.operation == "zoom":
+            screen_delta = QPointF(event.pos()) - self.anchor_widget
+            if abs(screen_delta.x()) >= 4 and abs(screen_delta.y()) >= 4 and self.preview.width() >= 1 and self.preview.height() >= 1:
+                self.emit_event("zoom_end", pos, bbox=box_values(self.preview))
+                self.view_rect = QRectF(self.preview)
+                self.viewChanged.emit()
+            else:
+                self.emit_event("zoom_end", pos, canceled=True)
+        elif self.operation == "create":
+            box = box_values(self.preview)
+            self.emit_event("create_end", pos, bbox=box, index=self.selected_bbox_index)
+            if box[0] < box[2] and box[1] < box[3]:
+                self.bboxes.append(rect_from_box(box))
+            else:
+                # Keep the attempted action in the trace, but not a zero-area final box.
+                self.emit_event("delete_bbox", index=self.selected_bbox_index, bbox=box)
+                self.selected_bbox_index = -1
+            self.emit_event("up", pos)
+        else:
+            box = box_values(self.bboxes[self.selected_bbox_index])
+            if box[0] >= box[2] or box[1] >= box[3]:
+                self.bboxes[self.selected_bbox_index] = self.before
+            else:
+                self.bboxes[self.selected_bbox_index] = rect_from_box(box)
+            self.emit_event("edit_end", pos, **self.edit_fields())
+        self.operation = self.preview = None
+        self.recorder.reset_motion()
+        self.contentChanged.emit()
+        self.update()
 
-            if self.drawing:
-                if (abs(self.current_bbox.width()) < 5 or
-                        abs(self.current_bbox.height()) < 5):
-                    if self.current_bbox in self.bboxes:
-                        self.bboxes.remove(self.current_bbox)
-                    self.selected_bbox_index = -1
-                else:
-                    self.record_event("create_end", pos, {
-                        "index": self.selected_bbox_index,
-                        "after": [
-                            self.current_bbox.left(),
-                            self.current_bbox.top(),
-                            self.current_bbox.right(),
-                            self.current_bbox.bottom()
-                        ]
-                    })
-
-            elif self.moving:
-                self.record_event("move_end", pos, {
-                    "index": self.selected_bbox_index,
-                    "after": [
-                        self.current_bbox.left(),
-                        self.current_bbox.top(),
-                        self.current_bbox.right(),
-                        self.current_bbox.bottom()
-                    ]
-                })
-
-            elif self.resizing:
-                self.record_event("resize_end", pos, {
-                    "index": self.selected_bbox_index,
-                    "corner": self.resize_corner,
-                    "after": [
-                        self.current_bbox.left(),
-                        self.current_bbox.top(),
-                        self.current_bbox.right(),
-                        self.current_bbox.bottom()
-                    ]
-                })
-
-            self.record_event("up", pos)
-
-            # 鼠标释放后重新开始悬停记录
-            self.is_hovering = False
-
-            # 重置状态
-            self.drawing = False
-            self.moving = False
-            self.resizing = False
-            self.resize_corner = None
-            self.move_start_pos = None
-            self.move_start_bbox = None
-
-    def keyPressEvent(self, event):
-        """键盘事件"""
-        if event.key() == Qt.Key_Delete:
-            self.delete_selected_bbox()
-
-    def delete_selected_bbox(self):
-        """删除选中的bbox"""
-        if 0 <= self.selected_bbox_index < len(self.bboxes):
-            bbox = self.bboxes[self.selected_bbox_index]
-            self.record_event("delete", QPoint(0, 0), {
-                "index": self.selected_bbox_index,
-                "bbox": [bbox.left(), bbox.top(), bbox.right(), bbox.bottom()]
-            })
-            del self.bboxes[self.selected_bbox_index]
+    def cancel_operation(self):
+        if not self.operation:
+            return
+        if self.operation == "zoom":
+            self.emit_event("zoom_end", self.last_pos, canceled=True)
+        elif self.operation == "edit":
+            self.bboxes[self.selected_bbox_index] = self.before
+            self.emit_event("edit_end", self.last_pos, **self.edit_fields())
+        else:
+            box = box_values(self.preview)
+            self.emit_event("create_end", self.last_pos, bbox=box, index=self.selected_bbox_index)
+            self.emit_event("delete_bbox", index=self.selected_bbox_index, bbox=box)
+            self.emit_event("up", self.last_pos)
             self.selected_bbox_index = -1
-            self.mark_content_changed()
+        self.operation = self.preview = None
+        self.contentChanged.emit()
+        self.update()
+
+    def reset_view(self):
+        if self.image.isNull():
+            return
+        self.cancel_operation()
+        if self.view_rect != self.image_rect:
+            self.emit_event("zoom_reset")  # Operation only; no button coordinates.
+            self.view_rect = self.image_rect
+            self.recorder.reset_motion()
+            self.viewChanged.emit()
             self.update()
 
-    def paintEvent(self, event):
-        """绘制事件"""
-        super().paintEvent(event)
-
-        if not self.pixmap():
+    def delete_selected_bbox(self):
+        if self.read_only or self.operation:
             return
+        if 0 <= self.selected_bbox_index < len(self.bboxes):
+            index = self.selected_bbox_index
+            self.emit_event("delete_bbox", index=index, bbox=box_values(self.bboxes[index]))
+            del self.bboxes[index]
+            self.selected_bbox_index = -1
+            self.contentChanged.emit()
+            self.update()
 
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
+    def clear_canvas(self):
+        """Delete boxes, preserving the entire search history and clock."""
+        if self.read_only:
+            return
+        self.cancel_operation()
+        while self.bboxes:
+            self.selected_bbox_index = len(self.bboxes) - 1
+            self.delete_selected_bbox()
 
-        # 绘制所有bbox
-        for i, bbox in enumerate(self.bboxes):
-            if i == self.selected_bbox_index:
-                pen = QPen(self.selected_bbox_color, self.pen_width)
-            else:
-                pen = QPen(self.bbox_color, self.pen_width)
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+            self.delete_selected_bbox()
+        elif event.key() == Qt.Key_R:
+            self.reset_view()
+        elif event.key() == Qt.Key_Escape:
+            self.cancel_operation()
+        else:
+            super().keyPressEvent(event)
 
-            painter.setPen(pen)
-            painter.drawRect(bbox)
+    def resizeEvent(self, event):
+        # A window resize changes the screen-to-image map, not pointer motion.
+        self.recorder.reset_motion()
+        self.viewChanged.emit()
+        super().resizeEvent(event)
 
-            # 如果是选中的bbox，绘制调整手柄
-            if i == self.selected_bbox_index:
-                self.draw_resize_handles(painter, bbox)
+    def freeze(self):
+        self.cancel_operation()
+        self.recorder.pause()
 
-    def draw_resize_handles(self, painter, bbox):
-        """绘制调整手柄"""
-        handle_size = 6
-        painter.setBrush(self.selected_bbox_color)
+    def unfreeze(self):
+        self.recorder.resume()
 
-        corners = [
-            QPoint(bbox.left(), bbox.top()),
-            QPoint(bbox.right(), bbox.top()),
-            QPoint(bbox.left(), bbox.bottom()),
-            QPoint(bbox.right(), bbox.bottom())
-        ]
+    def show_record(self, record):
+        self.bboxes = [rect_from_box(box) for box in record["final_bboxes_pixels"]]
+        self.recorder.restore(record["events"])
+        self.recorder.enabled = False
+        self.read_only = True
+        self.has_changes = False
+        self.update()
 
-        for corner in corners:
-            handle_rect = QRect(corner.x() - handle_size // 2,
-                                corner.y() - handle_size // 2,
-                                handle_size, handle_size)
-            painter.fillRect(handle_rect, self.selected_bbox_color)
+    def snapshot(self):
+        return dict(boxes=self.get_final_bboxes(), events=self.get_events(), view=box_values(self.view_rect),
+                    image_size=[self.image.width(), self.image.height()])
+
+    def restore(self, snapshot):
+        if snapshot["image_size"] != [self.image.width(), self.image.height()]:
+            raise ValueError("草稿的原图尺寸与当前图片不一致")
+        self.bboxes = [rect_from_box(box) for box in snapshot["boxes"]]
+        self.view_rect = rect_from_box(snapshot["view"]).intersected(self.image_rect)
+        if self.view_rect.isEmpty():
+            self.view_rect = self.image_rect
+        self.recorder.restore(snapshot["events"])
+        self.has_changes = bool(self.events or self.bboxes)
+        self.update()
 
     def get_final_bboxes(self):
-        """获取最终的bbox坐标列表"""
-        result = []
-        for bbox in self.bboxes:
-            left = min(bbox.left(), bbox.right())
-            top = min(bbox.top(), bbox.bottom())
-            right = max(bbox.left(), bbox.right())
-            bottom = max(bbox.top(), bbox.bottom())
-            result.append([left, top, right, bottom])
-        return result
+        return [box_values(box) for box in self.bboxes]
 
     def get_events(self):
-        """获取所有事件记录"""
-        sorted_events = sorted(self.events, key=lambda x: x["t"])
-        return sorted_events
+        return copy.deepcopy(self.events)  # Preserve append order, including equal timestamps.
 
     def has_unsaved_changes(self):
-        """检查是否有未保存的更改"""
         return self.has_changes
+
+    def reset_changes(self):
+        self.has_changes = False
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#202936"))
+        if self.image.isNull():
+            painter.setPen(QColor("#dae3ed"))
+            painter.drawText(self.rect().adjusted(24, 24, -24, -24), Qt.AlignCenter | Qt.TextWordWrap, self.message)
+            return
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        scale, offset = self.mapping()
+        target = QRectF(offset, self.view_rect.size() * scale)
+        painter.drawPixmap(target, self.image, self.view_rect)
+        painter.setClipRect(target)
+        for i, box in enumerate(self.bboxes):
+            color = QColor("#ff5f63" if i == self.selected_bbox_index else "#44e39a")
+            painter.setPen(QPen(color, 2))
+            rect = QRectF(self.to_widget(box.topLeft()), self.to_widget(box.bottomRight()))
+            painter.drawRect(rect)
+            painter.drawText(rect.topLeft() + QPointF(3, -4), str(i + 1))
+            if i == self.selected_bbox_index and not self.read_only:
+                for p in (rect.topLeft(), rect.topRight(), rect.bottomLeft(), rect.bottomRight()):
+                    painter.fillRect(QRectF(p.x() - 3, p.y() - 3, 6, 6), color)
+        if self.preview is not None:
+            painter.setPen(QPen(QColor("#75c7ff" if self.operation == "zoom" else "#44e39a"), 2, Qt.DashLine))
+            painter.drawRect(QRectF(self.to_widget(self.preview.topLeft()), self.to_widget(self.preview.bottomRight())))
