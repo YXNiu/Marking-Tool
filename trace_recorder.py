@@ -18,19 +18,28 @@ class TraceRecorder:
     def reset_motion(self):
         self.motion.clear()
 
-    def pause(self):
-        # Preserve elapsed time up to this point when canceled; a successful
-        # submission still uses the last canvas event, not this timestamp.
+    @property
+    def running(self):
+        return self.enabled and self.origin is not None
+
+    def stop_clock(self, now=None):
         if self.origin is not None:
-            self.offset += (self.clock() - self.origin) * 1000
+            self.offset += ((self.clock() if now is None else now) - self.origin) * 1000
         self.origin = None
-        self.enabled = False
         self.reset_motion()
 
-    def resume(self):
+    def pause(self):
+        """Suspend the session (for a dialog, navigation or submission)."""
+        self.stop_clock()
+        self.enabled = False
+
+    def resume(self, running=True):
+        """Allow events again; only restart time if the pointer is in the canvas."""
         self.enabled = True
-        if self.events:
+        if running and self.events and self.origin is None:
             self.origin = self.clock()
+        elif not running:
+            self.stop_clock()
 
     def restore(self, events):
         self.events = copy.deepcopy(events)
@@ -43,9 +52,13 @@ class TraceRecorder:
         if not self.enabled:
             return None
         now = self.clock()
-        if self.origin is None:
+        if kind == "canvas_enter" and self.origin is None:
             self.origin = now
-        relative = round(self.offset + (now - self.origin) * 1000, 1)
+            self.reset_motion()
+        if self.origin is None and kind not in ("zoom_reset", "delete_bbox"):
+            return None  # No pointer samples outside the canvas.
+        elapsed = self.offset + ((now - self.origin) * 1000 if self.origin is not None else 0)
+        relative = round(elapsed, 1)
         category = EVENT_CATEGORIES[kind]
         velocity = acceleration = 0.0
         if kind in ("hover_move", "zoom_move", "drag_move", "edit_move") and pos is not None:
@@ -63,4 +76,6 @@ class TraceRecorder:
             event.update(x=round(pos.x()), y=round(pos.y()))
         event.update(copy.deepcopy(fields))
         self.events.append(event)
+        if kind == "canvas_leave":
+            self.stop_clock(now)  # Freeze at the very same instant as the leave event.
         return event

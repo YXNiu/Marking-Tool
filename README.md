@@ -1,205 +1,298 @@
-# Marking-Tool · Human Search Traces
+# Marking-Tool
 
-用于记录人类视觉搜索过程与最终证据框的 **PyQt5 桌面标注工具**。本次 v2.0.0 根据 [YXNiu/Human-Search-Traces](https://huggingface.co/datasets/YXNiu/Human-Search-Traces) 的全部 1,144 条发布记录，以及项目维护者对交互流程的确认重建。
+**用于采集人类视觉搜索过程和证据框的桌面标注工具。** 标注员根据问题在原图中搜索、放大局部、标记证据并提交评价；工具保存鼠标交互轨迹、最终证据框、有效标注时长以及难度与置信度评分，可用于视觉语言模型研究和搜索行为分析。
 
-这是兼容发布数据的重建版本；没有找回当年未上传的源码，也不声称每一个内部实现与历史版本完全相同。依据、例外与新增改进见 [数据分析与重建说明](docs/reconstruction.md)。
+主要功能：
 
-## 1. 核心流程
+- 完整分辨率原图标注，支持区域放大、多证据框、移动和调整大小。
+- **鼠标离开画布，记录和计时一起暂停；返回后继续。**
+- **提交前隐藏参考答案，成功提交后显示答案。**
+- 支持多数据集，分别保存原图目录、草稿和标注结果。
+- 支持 JSON / JSONL 输入、独立会话 JSON 保存和 JSONL 汇总导出。
 
-1. 加载问题与原图，**答案和已有证据框在新标注时隐藏**。
-2. 初始无图像滚动条，按窗口显示整张原图；右键拖出矩形，查看该局部，可连续放大。
-3. 左键拖动标注证据框，支持多框、移动、四角调整和删除。
-4. 点击「提交并评价」，用两个 0–1 滑条选择难度与证据置信度，或选择歧义。
-5. **成功保存后才显示参考答案**，当前记录锁定，停留本题。
-6. 手动点击「下一题 / 跳过」继续；不要求每题必须提交。
+## 1. 安装与启动
 
-全程保留原始图像像素，显示适配不会修改原图。轨迹只采集画布交互，按钮点击和评分滑条不采集。输出坐标统一为原图像素，详见 [数据契约](docs/data_contract.md)。
-
-多数据集的统一目录、输入文件、切换、保存与备份流程见 [多数据集操作手册](docs/workflow.md)。工具会按任务文件自动分开建立输出文件夹，不需要为每个数据集手动改代码。
-
-## 2. 安装与启动
-
-推荐 Python 3.11。支持 Python 3.10+；本次已在 macOS Apple Silicon、Python 3.11、PyQt5 5.15.11 上验证。Linux 无显示环境只能跑测试，实际标注需要桌面会话。
+需要 **Python 3.10 或以上版本**，推荐 Python 3.11，以及可运行桌面窗口的环境。
 
 ```bash
 git clone git@github.com:YXNiu/Marking-Tool.git
 cd Marking-Tool
 python3 -m venv .venv
-source .venv/bin/activate
+```
+
+激活环境：
+
+| 系统 | 命令 |
+| --- | --- |
+| macOS / Linux | `source .venv/bin/activate` |
+| Windows PowerShell | `.venv\Scripts\Activate.ps1` |
+| Windows 命令提示符 | `.venv\Scripts\activate.bat` |
+
+安装依赖并启动：
+
+```bash
 python -m pip install -r requirements.txt
 python main.py
 ```
 
-Windows 激活命令为 `.venv\Scripts\activate`。macOS 创建好 `.venv` 后，也可双击仓库里的 `启动标注工具.command`。
+之后每次启动，只需激活环境并运行 `python main.py`。macOS 用户配置好 `.venv` 后，也可以双击 `启动标注工具.command`。
 
-如果用 Git 下载仓库中的旧 `data.rar`，需安装 Git LFS，再运行 `git lfs install --local && git lfs pull`。这个归档仅包含旧 VLM-R1 任务 JSON，不是新版运行必需的数据，也不包含 VisualProbe 原图。
-
-### 先用练习题试操作
+### 先用练习题熟悉操作
 
 ```bash
 python tools/create_demo.py data/demo
 python main.py --data data/demo/tasks.json --output output/practice
 ```
 
-练习图为程序生成的红、蓝矩形，标记为 `synthetic_practice`，不能混入研究数据。输出目录与正式标注分开。
+练习图包含红、蓝矩形，可用来试画框、缩放、提交和导出。练习数据与正式标注分开保存；同一个练习目录已经建立后，直接运行第二条命令即可。
 
-## 3. 准备正式任务和原图
+## 2. 准备任务文件和原图
 
-[Human-Search-Traces](https://huggingface.co/datasets/YXNiu/Human-Search-Traces) 发布的是 1,144 条原始会话，**不含图片**。图片来自 [Mini-o3/VisualProbe_train](https://huggingface.co/datasets/Mini-o3/VisualProbe_train)。
+建议每个数据集或 split 使用独立目录：
 
-可加载三类输入：
-
-| 输入 | 用途 | 处理方式 |
-| --- | --- | --- |
-| VisualProbe 原始 `train.json` | 新标注任务 | `doc_id/problem/solution/images/data_source` 转为内部任务 |
-| 发布的 `train_search_traces.jsonl` 或单条会话 JSON | 重新标注或只读检查 | 新标注默认隐藏源答案、框、轨迹和评分；检查请加 `--review` |
-| 旧 `id/image/instruction` 或 VLM-R1 `messages/images` | 兼容旧任务 | 可重新采集；旧屏幕坐标不会被猜测转换成原图坐标 |
-
-### 获取发布数据
-
-```bash
-git clone https://huggingface.co/datasets/YXNiu/Human-Search-Traces ../Human-Search-Traces
-git -C ../Human-Search-Traces lfs install --local
-git -C ../Human-Search-Traces lfs pull
+```text
+datasets/
+├── dataset_a/
+│   ├── tasks.jsonl
+│   └── images/
+│       ├── 001.jpg
+│       └── 002.jpg
+└── dataset_b/
+    ├── tasks.jsonl
+    └── images/
+        ├── 001.jpg
+        └── 002.jpg
 ```
 
-### 只下载本次任务需要的图片
+### 推荐输入：JSONL
 
-```bash
-python -m pip install -r requirements-download.txt
-python tools/download_images.py \
-  ../Human-Search-Traces/data/train_search_traces.jsonl \
-  ../VisualProbe_images
+**一行一个任务对象**，使用 UTF-8 编码；没有外层方括号，各行之间不加逗号。例如：
+
+```jsonl
+{"id":"a_001","image":"images/001.jpg","question":"标牌上的数字是多少？","answer":"30","source_dataset":"dataset_a"}
+{"id":"a_002","image":"images/002.jpg","question":"门前的春联共有多少个字？","answer":"14","source_dataset":"dataset_a"}
 ```
 
-默认下载任务中引用的全部原图，体积可能达到数 GB；`--limit 2` 只取前两题，`--list-only` 仅列清单。下载可重复执行，使用 Hugging Face 的本地缓存。此脚本只适用于 VisualProbe，其他数据请自行指定图像目录。
+| 字段 | 内容 |
+| --- | --- |
+| `id` | 任务 ID，建议每题唯一；也支持 `sample_id` |
+| `image` | 原图路径，必填 |
+| `question` | 给标注员看的问题，必填 |
+| `answer` | 参考答案，提交前隐藏；缺失时保存为空字符串 |
+| `source_dataset` | 数据来源名称，建议填写，例如 `dataset_a` |
 
-启动：
+相对图片路径以**任务文件所在目录**为基准。例如上面的 `images/001.jpg` 对应 `dataset_a/images/001.jpg`。如果 `image` 只写了文件名，可以在界面里单独选择原图目录。
+
+还支持 JSON 数组 `[{...}, {...}]`、单条 JSON 对象，以及以下常用输入格式：
+
+| 格式 | 可识别字段 |
+| --- | --- |
+| VisualProbe | `doc_id / problem / solution / images / data_source` |
+| Human-Search-Traces | `sample_id / image / question / answer` 等会话字段 |
+| 标准指令任务 | `id / image / instruction` |
+| VLM-R1 | `messages / images` |
+
+加载已有会话作为新任务时，其答案、证据框、评分和轨迹不会预先显示。查看已有结果请使用后文的只读检查模式。
+
+## 3. 首次配置数据集
+
+1. 点击 **「选择输出根目录」**，选择所有标注结果统一保存的位置，例如 `annotations`。不选择时，默认使用工具目录下的 `output`。
+2. 顶部的数据集名称可留空自动识别，也可在加载前填写便于辨认的名称。
+3. 点击 **「加载 JSON / JSONL」**，选择本次数据集的任务文件。
+4. 若未找到图片，点击 **「选择原图目录」**，选择该数据集的图片文件夹。
+5. 核对左侧的任务 ID、问题、来源，以及右侧显示的原图，开始标注。
+
+原图目录会按数据集分别记忆。切换数据集时，再选择另一份任务文件即可；同名图片和相同任务 ID 的输出也会隔离保存。
+
+也可以用命令行一次指定：
 
 ```bash
 python main.py \
-  --data ../Human-Search-Traces/data/train_search_traces.jsonl \
-  --images-root ../VisualProbe_images/data \
-  --output output/annotations
+  --data datasets/dataset_a/tasks.jsonl \
+  --images-root datasets/dataset_a/images \
+  --output annotations \
+  --dataset-name dataset_a
 ```
 
-若希望从全部原始问题开始，使用官方 `train.json`：
+## 4. 完整标注步骤
 
-```bash
-hf download Mini-o3/VisualProbe_train train.json \
-  --repo-type dataset --local-dir ../VisualProbe_train
-python tools/download_images.py ../VisualProbe_train/train.json ../VisualProbe_images
-python main.py --data ../VisualProbe_train/train.json \
-  --images-root ../VisualProbe_images/data --output output/annotations
-```
+### 第一步：阅读问题
 
-下载工具调用官方 `snapshot_download`，方法参考 [Hugging Face 下载文档](https://huggingface.co/docs/huggingface_hub/guides/download)。如果命令行无法连接 Hugging Face，而系统已有代理，可给当前命令设置 `HTTPS_PROXY` / `HTTP_PROXY`，不要把个人代理配置或令牌写进仓库。
+先在左侧阅读问题。将鼠标停在左侧控制面板时，画布记录与计时处于暂停状态。参考答案显示为「提交后显示」。
 
-## 4. 逐步标注
+### 第二步：进入画布搜索
 
-### 阅读与搜索
+将鼠标移入右侧图像画布，开始或继续记录。初始显示整张原图，没有图像滚动条。
 
-打开任务后先读左侧问题，参考答案显示为「提交后显示」。已有发布记录作为任务输入时，不会预填答案、框或评分。整张图初始适配右侧区域，没有图像滚动条；小目标请用**鼠标右键拖出一个局部矩形**，松开后放大。可在放大的视图里再次右键框选。
+目标较小时，用**右键拖出一个矩形区域**，松开后查看放大的局部；可以继续右键框选进行多级放大。点击「恢复全图」或按 `R` 返回整图。
 
-「恢复全图」按钮或 `R` 回到整图。这里改变的是显示视图，原始图像缓冲区保持原分辨率；不用预先把原图缩小或手工改坐标。
+图像保留原始分辨率。显示适配与局部放大只改变查看方式，所有标注坐标始终对应原图。
 
-### 画框与修正
+### 第三步：标记证据
+
+用**左键拖动**画出回答问题所需的证据框。如果证据分布在多个位置，可以分别画多个框。
 
 | 操作 | 方法 |
 | --- | --- |
-| 新建证据框 | 左键按住并拖动，可从任意角开始 |
-| 多个分散证据 | 在其他区域继续画框 |
-| 在已有框内部新建框 | `Shift` + 左键拖动 |
-| 选中 / 移动 | 左键点框内部并拖动，选中框为红色 |
-| 调整大小 | 拖动四个角的手柄 |
-| 删除 | 选中框后点「删除选中框」，或 Delete / Backspace |
-| 清空 | 「清空证据框」会逐个删除框，**不会抹除此前轨迹** |
-| 取消未完成拖动 | Esc；已开始的动作仍保留结束/删除记录 |
+| 新建证据框 | 左键拖动，任意角都可以作为起点 |
+| 在已有框内部再画一个框 | `Shift` + 左键拖动 |
+| 选中框 | 左键点击框；选中框为红色 |
+| 移动框 | 拖动框内部 |
+| 调整大小 | 拖动框的四个角点 |
+| 删除选中框 | 点击「删除选中框」，或按 Delete / Backspace |
+| 删除全部框 | 点击「清空证据框」并确认；此前的搜索轨迹仍然保留 |
+| 取消当前拖动 | 按 Esc |
+| 恢复全图 | 点击「恢复全图」，或按 `R` |
 
-新框限制在图像边界内，零面积误点击不会留在最终框里。框的上限不固定为一个或两个：发布数据出现过双框，但这不是最大允许数量。
+请尽量围住完整且与问题相关的证据。操作可以修正，工具会保留修正过程。零面积误点击不会成为最终证据框。未完成的拖动如果越出画布，会取消本次拖动，已经完成的框仍保留。
 
-建议圈出回答问题所需的完整视觉证据。分散证据可分别框选，例如两侧春联计字需要两个框。这是样例支持的操作建议；数据本身不能证明某种固定扫描路线、鼠标停留阈值或“绝不允许修正”等规则。不要为了产生整齐的轨迹而伪造或补画搜索过程。
+### 第四步：提交并评价
 
-### 提交与评分
+点击 **「提交并评价」**，或使用 `Ctrl+S`（macOS 为 `⌘+S`），填写两项评分：
 
-点击「提交并评价」或 `Ctrl+S`（macOS 为 `⌘+S`）。两个滑条支持 0.00–1.00，精度 0.01，也可在右侧数值框精确输入：
+| 评分 | 范围 | 含义 |
+| --- | --- | --- |
+| 搜索 / 定位难度 | 0.00–1.00 | 越大表示越难；默认 0.50 |
+| 证据正确性置信度 | 0.00–1.00 | 越大表示越有把握；默认 1.00 |
 
-- 搜索 / 定位难度：越大越难；新版本默认 0.50。
-- 证据正确性置信度：越大越有把握；新版本默认 1.00。
-- 勾选歧义：`difficulty_level="ambiguous"`，两项分数均为 `null`。
+滑条精度为 0.01，也可以在数值框直接输入。难度等级自动映射为：`≤0.30 easy`、`(0.30,0.60] medium`、`>0.60 hard`。如果问题存在歧义，勾选歧义选项，两项分数保存为 `null`，等级为 `ambiguous`。
 
-当前等级映射为 `≤0.30 easy`、`(0.30, 0.60] medium`、`>0.60 hard`，覆盖所有已发布样例。历史边界值及默认值不能从数据唯一恢复，这些是明确记录的新版本选择。
+**只有成功保存后才会显示参考答案。** 提交成功后当前记录锁定，界面停留本题；评分取消或保存失败时，答案继续隐藏，可以返回标注。
 
-评分期间不追加画布事件，不记录滑条或按钮的鼠标坐标。取消评分后返回标注，参考答案继续隐藏；取消对话框中花费的时间从后续画布时钟排除。提交失败时保持本题和答案隐藏，可修复磁盘 / 权限问题后再次提交。
+### 第五步：下一题或跳过
 
-成功提交后显示参考答案，记录转为只读，避免看过答案后的动作混入原搜索过程。**不会自动进入下一题**，请手动继续。重复点击提交不会产生额外版本。
+点击 **「下一题 / 跳过」** 继续。当前题无需先提交，因此可以跳过暂时不想标的题。未提交内容保留为草稿，不作为完成记录导出。
 
-### 跳过、返回与退出
+- 「上一题」返回前一题；`Alt+←` / `Alt+→` 可快捷导航。
+- 「跳转到序号 / ID」支持输入题号或任务 ID，界面题号从 **1** 开始。
+- 命令行 `--start-index` 从 **0** 开始；也可使用 `--start-id a_001`。
 
-「下一题 / 跳过」始终可用于导航到下一题，无须先提交。未提交内容每 5 秒及切题 / 关闭时写入当前数据集文件夹的 `.drafts`，返回该题或重启后可恢复。正在拖动时不做中间草稿，切题会先结束 / 取消该拖动。
+## 5. 记录和计时规则
 
-切到其他题及程序关闭期间不计入恢复后的轨迹时钟；本地 `.metadata` 会注明恢复段数。它不属于发布 JSON 的 11 个字段。需要严格单次、不中断研究会话时，请统一安排连续完成，不混用恢复草稿与连续会话。
+**时间只在鼠标位于画布内、且会话正在采集时累计。** 画布指右侧图像交互区域，包含随窗口比例产生的留白；左侧问题、按钮和评分控件不属于画布。
 
-「跳转到序号 / ID」中的题号从 **1** 开始；命令行 `--start-index` 从 **0** 开始。还可指定 `--start-id visual_probe_train_1001`。快捷导航为 `Alt+→` / `Alt+←`。
+| 状态 | 鼠标轨迹 | 计时 |
+| --- | --- | --- |
+| 鼠标位于画布内 | 记录交互 | 继续累计 |
+| 鼠标离开画布 | 暂停 | 暂停 |
+| 鼠标返回画布 | 从原记录继续 | 从暂停时刻继续 |
+| 评分、切题、关闭后等待恢复 | 暂停 | 暂停 |
+| 已提交 / 只读检查 | 不采集新轨迹 | 不再累计 |
 
-缺图时会清空旧画布并禁用提交，仍可继续导航，不会把上一题的图或框保存到本题。界面可随时选择原图目录；默认相对路径相对于任务文件目录解析，显式指定的原图目录优先。
+例如：在画布内操作 5 秒，移到左侧停留 20 秒，再回到画布操作 3 秒，则累计标注时间为 **8 秒**。重新进入不会清空原轨迹，也不会把离开的 20 秒加进去。画布上方会显示「记录中」「已暂停」或「只读」。
 
-## 5. 输出与检查
+其他记录约定：
 
-每个成功提交会生成一个 JSON：
+- **原点为原图左上角**，x 向右、y 向下；放大后仍使用整张原图的像素坐标。
+- 移动事件约每 100 ms 最多记录一次，即约 10 Hz；鼠标静止时不会强制补点。
+- 按下、释放、进入、离开、操作开始 / 结束等关键事件即时记录。
+- 事件 `t` 使用累计有效时间，单位为毫秒，首次画布事件为 0。
+- `annotation_time` 使用最后一个事件的 `t / 1000`，单位为秒，保留两位小数。
+- 不记录按钮和评分滑条的鼠标轨迹、点击坐标。恢复全图、删除等结果仍保存相应操作事件；鼠标在画布外触发时，事件使用暂停时刻，时长不增加。
+
+## 6. 保存、恢复和导出
+
+### 自动保存草稿
+
+未提交内容每 5 秒以及切题、退出时保存到本数据集的 `.drafts`。正在拖动时不保存中间草稿；切题或退出会先取消未完成拖动。
+
+重新打开同一份任务文件、使用同一个输出根目录，会恢复原图目录和草稿。已提交题以只读方式显示；未提交题仍隐藏答案。草稿恢复后，鼠标返回画布才继续计时，退出期间不计入时长。
+
+### 输出目录
+
+工具按任务文件自动建立工作文件夹：
 
 ```text
-output/annotations/                         # 选择的输出根目录
-└── visualprobe_train--0123456789/           # 自动名称 + 任务文件标识（示意）
-    ├── workspace.json                     # 本地目录配置与来源校验
+annotations/                         # 选择的输出根目录
+└── dataset_a--<任务文件标识>/
+    ├── workspace.json               # 原图目录、任务来源等本地配置
     ├── sessions/
-    │   └── visual_probe_train_1001_idx950_v1.json
-    ├── .drafts/                           # 未提交草稿，不参与导出
-    ├── .metadata/                         # 工具版本、原图尺寸、恢复段数
-    └── exports/                           # 界面导出 JSONL 的推荐位置
+    │   ├── a_001_idx0_v1.json        # 每次成功提交一个文件
+    │   └── a_002_idx1_v1.json
+    ├── .drafts/                     # 尚未提交的草稿
+    ├── .metadata/                   # 工具版本、原图尺寸等辅助信息
+    └── exports/                     # 推荐的汇总导出位置
 ```
 
-`id` 与文件名一致，`sample_id` 保留源任务 ID。原始任务的 `idx` 是源文件中的零基索引；载入已发布会话重新标注时保留其原 `idx`，从高于源版本的版本号开始。已有文件不会覆盖，重启及并发保存都会递增版本号。
+文件名中的 `idx` 是源任务的零基索引，`v` 是会话版本。已有文件不会覆盖；需要生成新版本时，版本号递增。
 
-优先点击界面「导出当前数据集 JSONL」。也可把所有已提交版本合并为 JSONL（将下列数据集目录替换为实际目录）：
+**开始标注后尽量固定任务文件的位置和内容。** 修改、移动或重命名任务文件会建立新的工作文件夹，旧结果仍保留。切换输出根目录也不会自动搬迁旧数据。备份时请保留整个输出根目录、任务文件和原图。
+
+### 导出 JSONL
+
+点击 **「导出当前数据集 JSONL」**，选择保存位置。导出只包含 `sessions` 中的已提交记录，不包含草稿和本地配置。目标文件已经存在时，请另选文件名。
+
+命令行导出方式如下，使用实际的数据集目录替换示例路径：
 
 ```bash
-python tools/export_jsonl.py "output/annotations/<数据集目录>/sessions" output/export_all.jsonl
+python tools/export_jsonl.py \
+  "annotations/dataset_a--<任务文件标识>/sessions" \
+  "annotations/dataset_a--<任务文件标识>/exports/sessions.jsonl"
 ```
 
-默认保留每个独立会话。若明确只需同一任务的最高版本，可加 `--latest-only`。导出目标已存在时会拒绝覆盖；草稿和元数据不会导出。
+默认保留所有独立会话版本。确实只需要同一任务的最高版本时，可加 `--latest-only`。
 
-验证发布或导出的数据：
+输出每条会话包含 `id`、`sample_id`、`image`、`question`、`answer`、`final_bboxes_pixels`、`events`、`annotation_time`、`task_evaluation`、`source_format`、`source_dataset`，完整说明见 [数据格式与事件定义](docs/data_contract.md)。
 
-```bash
-python tools/audit_traces.py output/export_all.jsonl --output output/audit.json
-```
+## 7. 查看和检查已有结果
 
-只读检查历史证据框与答案：
+只读查看最终框、参考答案和会话统计：
 
 ```bash
 python main.py --review \
-  --data ../Human-Search-Traces/data/train_search_traces.jsonl \
-  --images-root ../VisualProbe_images/data
+  --data path/to/sessions.jsonl \
+  --images-root path/to/images
 ```
 
-只读模式允许局部放大和恢复全图，但不会采集新事件，也不能提交。它显示最终证据框与会话统计，不是历史视图的逐帧录像播放器；原发布数据也不包含完整的屏幕尺寸 / 显示缩放元数据。
+只读模式允许查看局部和恢复全图，不采集新事件。它展示最终结果，不是逐帧轨迹播放器。
 
-## 6. 详细依据与开发验证
+检查数据格式、时间顺序和框的基本有效性：
 
-- [字段、事件、坐标与时间契约](docs/data_contract.md)
-- [多数据集目录、任务文件、切换、备份和统一操作流程](docs/workflow.md)
-- [1,144 条记录的反推分析、七个样例及已知异常](docs/reconstruction.md)
-- [可复算的全量数据审计](docs/data_audit.json)
+```bash
+python tools/audit_traces.py path/to/sessions.jsonl --output path/to/audit.json
+```
+
+## 8. VisualProbe 数据准备示例
+
+如果使用 VisualProbe，可以通过官方 Hugging Face 仓库获取任务，并按任务下载对应原图：
+
+```bash
+python -m pip install -r requirements-download.txt
+hf download Mini-o3/VisualProbe_train train.json \
+  --repo-type dataset --local-dir ../VisualProbe_train
+python tools/download_images.py ../VisualProbe_train/train.json ../VisualProbe_images --limit 2
+python main.py --data ../VisualProbe_train/train.json \
+  --images-root ../VisualProbe_images/data --output annotations
+```
+
+`--limit 2` 用于先试前两题；去掉该参数即可下载任务文件涉及的全部原图。`--list-only` 只列清单。图像下载支持缓存，完整图集可能占用数 GB。
+
+[Human-Search-Traces](https://huggingface.co/datasets/YXNiu/Human-Search-Traces) 会话文件也可直接加载，但其中不包含图片，仍需准备对应的 VisualProbe 原图。其他数据集按第 2 节整理任务和图片即可。
+
+## 9. 注意事项与常见问题
+
+| 情况 | 处理方式 |
+| --- | --- |
+| 提示找不到图片 | 核对 `image` 路径，或重新选择该数据集的原图目录；缺图题不能提交，但可以跳过 |
+| 切换数据集后出现同名图片 | 为新数据集单独选择原图目录；工具不会继承前一个数据集的目录 |
+| 加载失败并提示某一行 JSON 错误 | 检查该行是否是完整对象；JSONL 的行与行之间不要写逗号 |
+| 评分取消或保存失败 | 当前题保留、答案隐藏；检查输出目录权限 / 磁盘空间后重试 |
+| 回来后没有看到原草稿 | 核对任务文件路径、内容、数据集名称和输出根目录是否与之前一致 |
+| 导出目标已存在 | 换一个导出文件名，原 sessions 文件保留 |
+| 需要暂停阅读、休息或操作控件 | 把鼠标移出画布；返回后继续，不额外计入离开时间 |
+
+正式采集前建议先完成一题练习，确认原图、输出目录和评分步骤。采集过程中按实际搜索过程操作，先完成证据标注再提交查看答案；练习结果应与正式结果分开。
+
+## 10. 更多说明与开发测试
+
+- [多数据集统一操作手册](docs/workflow.md)
+- [数据格式、坐标、时间与事件定义](docs/data_contract.md)
+- [验证记录](docs/validation.md)
 - [变更说明](CHANGELOG.md)
-- [本次验证范围与结果](docs/validation.md)
 
 ```bash
 python -m pip install -r requirements-dev.txt
 QT_QPA_PLATFORM=offscreen python -m pytest -q
-python tools/audit_traces.py ../Human-Search-Traces/data/train_search_traces.jsonl
 ```
 
-测试覆盖原图坐标、多级缩放、任意方向绘框、编辑删除、轨迹保留、隐藏答案、取消 / 失败提交、草稿恢复、缺图保护、版本冲突和导出。若旁边没有下载发布数据，全量数据回归测试会跳过，其他测试使用独立的合成图和临时目录。
-
-原数据的授权范围与图像授权仍以 [Human-Search-Traces 数据说明](https://huggingface.co/datasets/YXNiu/Human-Search-Traces) 和上游 VisualProbe 为准；工具不会上传任何标注、图像或操作记录。
+图像、任务和标注结果均在本地处理，工具不会自动上传采集内容。使用外部数据集时，请遵循对应数据集的授权条件。

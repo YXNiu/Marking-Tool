@@ -114,6 +114,95 @@ def test_clock_throttle_pause_and_negative_positions():
     assert recorder.events[-1]["v"] == 0  # reset baseline, no false jump
 
 
+def test_leave_pauses_clock_and_samples_until_reentry(canvas):
+    now = [100.0]
+    canvas.recorder = TraceRecorder(clock=lambda: now[0])
+    mouse(canvas, QEvent.MouseMove, QPointF(100, 200))
+    now[0] = 101.5
+    canvas.leaveEvent(QEvent(QEvent.Leave))
+    assert canvas.events[-1]["type"] == "canvas_leave"
+    assert canvas.events[-1]["t"] == 1500
+    assert not canvas.recorder.running
+    before = canvas.get_events()
+    now[0] = 281.5  # Three minutes on the controls / outside the canvas.
+    mouse(canvas, QEvent.MouseMove, QPointF(-20, 200))
+    assert canvas.get_events() == before
+    assert canvas.recorder.record("hover_move", QPointF(1, 1)) is None
+    mouse(canvas, QEvent.MouseMove, QPointF(300, 200))
+    assert canvas.events[-2]["type"] == "canvas_enter"
+    assert canvas.events[-2]["t"] == 1500
+    assert canvas.events[-1]["v"] == 0
+    now[0] = 282.0
+    canvas.leaveEvent(QEvent(QEvent.Leave))
+    assert canvas.events[-1]["t"] == 2000  # 1.5 + 0.5 active seconds only.
+
+
+@pytest.mark.parametrize("button", [Qt.LeftButton, Qt.RightButton])
+def test_drag_outside_canvas_stops_even_while_mouse_is_grabbed(canvas, button):
+    now = [100.0]
+    canvas.recorder = TraceRecorder(clock=lambda: now[0])
+    mouse(canvas, QEvent.MouseButtonPress, QPointF(200, 200), button)
+    now[0] = 100.2
+    mouse(canvas, QEvent.MouseMove, QPointF(400, 300), button)
+    now[0] = 100.5
+    mouse(canvas, QEvent.MouseMove, QPointF(900, 300), button)
+    assert canvas.operation is None
+    assert canvas.events[-1]["type"] == "canvas_leave"
+    assert canvas.events[-1]["t"] == 500
+    assert not canvas.bboxes  # Unfinished creation/zoom was canceled at the boundary.
+    before = canvas.get_events()
+    now[0] = 200.5
+    mouse(canvas, QEvent.MouseButtonRelease, QPointF(900, 300), button)
+    assert canvas.get_events() == before
+    assert not canvas.recorder.running
+
+
+def test_controls_keep_semantic_events_at_paused_time(canvas):
+    now = [100.0]
+    canvas.recorder = TraceRecorder(clock=lambda: now[0])
+    drag(canvas, QPointF(200, 200), QPointF(400, 300))
+    drag(canvas, QPointF(100, 150), QPointF(600, 400), Qt.RightButton)
+    now[0] = 101.0
+    canvas.leaveEvent(QEvent(QEvent.Leave))
+    now[0] = 401.0
+    canvas.reset_view()
+    canvas.delete_selected_bbox()
+    assert [event["type"] for event in canvas.events[-2:]] == ["zoom_reset", "delete_bbox"]
+    assert all(event["t"] == 1000 and "x" not in event for event in canvas.events[-2:])
+    assert not canvas.recorder.running
+
+
+def test_unfreezing_outside_and_draft_restore_wait_for_canvas(canvas):
+    now = [100.0]
+    canvas.recorder = TraceRecorder(clock=lambda: now[0])
+    mouse(canvas, QEvent.MouseMove, QPointF(100, 200))
+    now[0] = 101.0
+    canvas.leaveEvent(QEvent(QEvent.Leave))
+    canvas.freeze()
+    now[0] = 201.0
+    canvas.unfreeze()  # A canceled rating dialog must not restart outside time.
+    assert canvas.recorder.enabled and not canvas.recorder.running
+    snapshot = canvas.snapshot()
+    canvas.restore(snapshot)
+    now[0] = 1001.0
+    mouse(canvas, QEvent.MouseMove, QPointF(300, 200))
+    assert canvas.events[-2]["type"] == "canvas_enter"
+    assert canvas.events[-2]["t"] == 1000
+
+
+def test_unfreezing_inside_resumes_only_after_dialog(canvas):
+    now = [100.0]
+    canvas.recorder = TraceRecorder(clock=lambda: now[0])
+    mouse(canvas, QEvent.MouseMove, QPointF(100, 200))
+    now[0] = 101.0
+    canvas.freeze()
+    now[0] = 201.0
+    canvas.unfreeze()  # Keyboard submission canceled while pointer stays inside.
+    now[0] = 201.5
+    mouse(canvas, QEvent.MouseMove, QPointF(300, 200))
+    assert canvas.events[-1]["t"] == 1500
+
+
 @pytest.fixture
 def window(app, tmp_path):
     image = QPixmap(4000, 2000)
@@ -171,6 +260,23 @@ def test_cancel_and_disk_failure_never_reveal_or_navigate(window, monkeypatch):
     assert window.data_processor.current_index == 0
     assert "hidden-answer" not in window.answer_label.text()
     assert not window.canvas.read_only
+
+
+def test_submission_duration_excludes_canvas_absence_and_rating(window, monkeypatch):
+    now = [100.0]
+    window.canvas.recorder = TraceRecorder(clock=lambda: now[0])
+    draw(window)
+    now[0] = 102.0
+    window.canvas.leaveEvent(QEvent(QEvent.Leave))
+    now[0] = 402.0
+    def confirm_rating(dialog):
+        now[0] = 502.0
+        return QDialog.Accepted
+    monkeypatch.setattr(EvaluationDialog, "exec_", confirm_rating)
+    assert window.save_annotation()
+    record = json.loads(next(window.store.output_dir.glob("*.json")).read_text())
+    assert record["annotation_time"] == 2.0
+    assert record["events"][-1]["t"] == 2000
 
 
 def test_skipping_restores_draft_without_submitting(window):

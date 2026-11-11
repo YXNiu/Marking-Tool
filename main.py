@@ -159,6 +159,7 @@ class AnnotationTool(QMainWindow):
             "Shift + 左键：在已有框内新建框\n"
             "Esc：取消当前拖动；R：恢复全图\n"
             "提交后停留当前题；下一题随时可跳过\n"
+            "离开画布暂停记录和计时，返回后继续\n"
             "按钮点击与评分操作不采集鼠标轨迹。", "#fff6df"))
         controls.addStretch()
         self.status_label = self.label("就绪")
@@ -263,7 +264,7 @@ class AnnotationTool(QMainWindow):
                         raise ValueError("任务内容已变化，未载入旧草稿")
                     self.canvas.restore(draft["canvas"])
                     self.resumed_segments = draft.get("resumed_segments", 0) + 1
-                    self.status_label.setText("已恢复未提交草稿；切题 / 关闭期间不计时。参考答案仍隐藏。")
+                    self.status_label.setText("已恢复未提交草稿；鼠标回到画布后继续记录和计时。参考答案仍隐藏。")
                 except (OSError, ValueError, KeyError, TypeError) as exc:
                     self.canvas.read_only = True
                     self.canvas.recorder.enabled = False
@@ -398,7 +399,7 @@ class AnnotationTool(QMainWindow):
         try:
             self.store.draft_path(self.data_processor.data_path, index).unlink(missing_ok=True)
             atomic_json(self.store.state_dir / ".metadata" / path.name,
-                        dict(tool_version="2.0.0", resumed_segments=self.resumed_segments,
+                        dict(tool_version="2.0.1", resumed_segments=self.resumed_segments,
                              image_size=[self.canvas.image.width(), self.canvas.image.height()]))
         except OSError as exc:
             self.status_label.setText(self.status_label.text() + f"\n已保存，但本地辅助信息未更新：{exc}")
@@ -422,8 +423,9 @@ class AnnotationTool(QMainWindow):
             self.view_label.setText("等待原图")
         else:
             scale, _ = self.canvas.mapping()
+            recording = "只读" if self.canvas.read_only else "记录中" if self.canvas.recorder.running else "已暂停"
             self.view_label.setText(f"原图 {self.canvas.image.width()} × {self.canvas.image.height()} px　"
-                f"显示比例 {scale:.1%}　证据框 {len(self.canvas.bboxes)}　事件 {len(self.canvas.events)}")
+                f"显示比例 {scale:.1%}　证据框 {len(self.canvas.bboxes)}　事件 {len(self.canvas.events)}　{recording}")
 
     def update_ui_state(self):
         loaded = self.data_processor is not None

@@ -94,9 +94,22 @@ class BBoxCanvas(QWidget):
         return event
 
     def ensure_enter(self, pos):
-        if not self.mouse_in_canvas:
-            self.emit_event("canvas_enter", pos)
+        if not self.mouse_in_canvas or (self.recorder.enabled and not self.recorder.running):
             self.mouse_in_canvas = True
+            self.emit_event("canvas_enter", pos)
+
+    def leave_canvas(self):
+        if not self.mouse_in_canvas:
+            return
+        # Qt can keep delivering mouse events while a pressed button grabs the
+        # pointer outside the widget. End the unfinished gesture at its last
+        # in-canvas position, then stop both sampling and the active-time clock.
+        self.cancel_operation()
+        self.end_hover(self.last_pos)
+        self.mouse_in_canvas = False
+        self.emit_event("canvas_leave", self.last_pos)
+        self.recorder.stop_clock()
+        self.viewChanged.emit()
 
     def end_hover(self, pos):
         if self.hovering:
@@ -104,18 +117,14 @@ class BBoxCanvas(QWidget):
             self.hovering = False
 
     def enterEvent(self, event):
-        if not self.image.isNull() and not self.read_only:
+        if not self.image.isNull():
             point = self.to_image(self.mapFromGlobal(QCursor.pos()))
             self.ensure_enter(point)
             self.last_pos = point
         super().enterEvent(event)
 
     def leaveEvent(self, event):
-        if not self.image.isNull() and not self.read_only and self.mouse_in_canvas:
-            self.end_hover(self.last_pos)
-            self.emit_event("canvas_leave", self.last_pos)
-            self.mouse_in_canvas = False
-            self.recorder.reset_motion()
+        self.leave_canvas()
         super().leaveEvent(event)
 
     def hit_test(self, widget_pos):
@@ -135,6 +144,9 @@ class BBoxCanvas(QWidget):
 
     def mousePressEvent(self, event):
         if self.image.isNull() or self.operation or event.button() not in (Qt.LeftButton, Qt.RightButton):
+            return
+        if not self.rect().contains(event.pos()):
+            self.leave_canvas()
             return
         if self.read_only and event.button() == Qt.LeftButton:
             return
@@ -194,6 +206,9 @@ class BBoxCanvas(QWidget):
     def mouseMoveEvent(self, event):
         if self.image.isNull():
             return
+        if not self.rect().contains(event.pos()):
+            self.leave_canvas()
+            return
         raw = self.to_image(event.pos())
         self.last_pos = raw
         if not self.read_only:
@@ -217,6 +232,9 @@ class BBoxCanvas(QWidget):
         self.update()
 
     def mouseReleaseEvent(self, event):
+        if not self.rect().contains(event.pos()):
+            self.leave_canvas()
+            return
         if not self.operation:
             return
         if (self.operation == "zoom") != (event.button() == Qt.RightButton):
@@ -321,9 +339,11 @@ class BBoxCanvas(QWidget):
     def freeze(self):
         self.cancel_operation()
         self.recorder.pause()
+        self.viewChanged.emit()
 
     def unfreeze(self):
-        self.recorder.resume()
+        self.recorder.resume(running=self.mouse_in_canvas)
+        self.viewChanged.emit()
 
     def show_record(self, record):
         self.bboxes = [rect_from_box(box) for box in record["final_bboxes_pixels"]]
@@ -331,6 +351,7 @@ class BBoxCanvas(QWidget):
         self.recorder.enabled = False
         self.read_only = True
         self.has_changes = False
+        self.viewChanged.emit()
         self.update()
 
     def snapshot(self):

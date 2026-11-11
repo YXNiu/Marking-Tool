@@ -112,4 +112,4 @@ class DatasetWorkspace:
             dataset_name=self.name, task_file=str(processor.data_path),
             source_sha256=self.source_sha256, task_count=len(processor.data),
             images_root=str(processor.images_root) if processor.images_root else None,
-            tool_version="2.0.0", sessions="sessions", exports="exports"))
+            tool_version="2.0.1", sessions="sessions", exports="exports"))
